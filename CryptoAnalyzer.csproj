@@ -1,0 +1,19 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Binance.Net" Version="13.7.0" />
+    <PackageReference Include="CodeHollow.FeedReader" Version="1.2.6" />
+    <PackageReference Include="Microsoft.Data.Sqlite" Version="10.0.14" />
+    <PackageReference Include="Skender.Stock.Indicators" Version="2.7.3" />
+    <PackageReference Include="Spectre.Console" Version="0.57.2" />
+    <PackageReference Include="Telegram.Bot" Version="22.10.3.3" />
+  </ItemGroup>
+
+</Project>
