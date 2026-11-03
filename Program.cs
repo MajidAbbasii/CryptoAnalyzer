@@ -570,139 +570,106 @@ class Program
             if (data15m == null || data1h == null || data15m.Count < 50 || data1h.Count < 50)
                 return null;
 
-            // قیمت ورود = آخرین قیمت نوبیتکس
             decimal? live = await GetNobitexLastPriceAsync(symbol);
             decimal price = live ?? data15m.Last().Close;
             if (price <= 0) return null;
 
+            if (IsStablePair(symbol, price)) return null;
+            if (HasPendingSignal(symbol)) return null;
+
             var a15 = AnalyzeTimeframe(data15m);
             var a1h = AnalyzeTimeframe(data1h);
-
             var (support, resistance) = FindSupportResistance(data1h);
+
+            var sma50 = data1h.GetSma(50).Last().Sma;
+            bool aboveSma50 = sma50 is not null && price >= (decimal)sma50.Value;
+
             double distSup = support > 0 ? (double)((price - support) / price * 100) : 100;
-            double distRes = resistance > 0 ? (double)((resistance - price) / price * 100) : 100;
-            bool nearSupport = distSup <= 1.0;
-            bool nearResistance = distRes <= 1.0;
+            bool nearSupport = distSup <= 2.0;
 
             int buyScore = a15.BuyScore + a1h.BuyScore;
             int sellScore = a15.SellScore + a1h.SellScore;
 
             bool bothBullish = a15.BuyScore > a15.SellScore && a1h.BuyScore > a1h.SellScore;
-            bool bothBearish = a15.SellScore > a15.BuyScore && a1h.SellScore > a1h.BuyScore;
-
             if (bothBullish) buyScore += 2;
-            if (bothBearish) sellScore += 2;
-            if (nearSupport && buyScore > sellScore) buyScore += 2;
-            if (nearResistance && sellScore > buyScore) sellScore += 2;
+            if (nearSupport) buyScore += 2;
+            if (aboveSma50) buyScore += 1;
 
-            // بعد از محاسبه buyScore / sellScore و bothBullish / bothBearish
-
-            var (aiScore, aiReason, newsList) = await GetNewsAiScoreAsync(
-                symbol, buyScore, sellScore);
-
+            var (aiScore, aiReason, _) = await GetNewsAiScoreAsync(symbol, buyScore, sellScore);
             if (aiScore > 0) buyScore += aiScore;
-            if (aiScore < 0) sellScore += (-aiScore);
+            if (aiScore < 0) sellScore += -aiScore;
+            if (aiScore <= -2) return null;
 
-            bool newsBlocksBuy = aiScore <= -2;
-            bool newsBlocksSell = aiScore >= 2;
+            // دیباگ (اختیاری — بعداً می‌توانی حذف کنی)
+            Console.WriteLine(
+                $"{symbol,-12} p={price:N4} nearSup={nearSupport} above50={aboveSma50} " +
+                $"bothBull={bothBullish} B={buyScore} S={sellScore} RSI={a15.Rsi:N0}/{a1h.Rsi:N0} AI={aiScore}");
 
-            string decision = "WAIT";
+            // فیلتر میانی
+            if (buyScore < 6 || buyScore < sellScore + 2) return null;
+            if (a15.Rsi >= 65 || a1h.Rsi >= 70) return null;
+            if (!nearSupport && !aboveSma50) return null;
+            if (!bothBullish && !nearSupport) return null;
 
-            if (!newsBlocksBuy &&
-                bothBullish && buyScore >= 7 && buyScore >= sellScore + 3 &&
-                a15.Rsi < 60 && a1h.Rsi < 65)
+            // SL / TP روی سطوح نوبیتکس
+            decimal stopLoss = (support > 0 && support < price)
+                ? support * 0.995m
+                : price * 0.985m;
+
+            if ((price - stopLoss) / price > 0.04m)
+                return null;
+
+            decimal takeProfit;
+            if (resistance > 0 && resistance > price)
+                takeProfit = Math.Min(resistance * 0.997m, price * 1.03m);
+            else
+                takeProfit = price * 1.025m;
+
+            decimal risk = price - stopLoss;
+            decimal reward = takeProfit - price;
+            if (risk <= 0 || reward / risk < 1.2m)
+                return null;
+
+            decimal slPercent = risk / price * 100;
+            decimal tpPercent = reward / price * 100;
+
+            Console.WriteLine($"{symbol,-12} | {price,12:N4} | Buy:{buyScore} Sell:{sellScore} | BUY");
+            SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, "BUY");
+            TrackSignal(symbol, price, stopLoss, takeProfit);
+
+            string text =
+                $"🟢 BUY پیشنهاد {symbol}\n" +
+                $"Entry: {price:N4} (Nobitex)\n" +
+                $"Support: {support:N4} | Resistance: {resistance:N4}\n" +
+                $"Stop Loss: {stopLoss:N4} (-{slPercent:N2}%)\n" +
+                $"Take Profit: {takeProfit:N4} (+{tpPercent:N2}%)\n" +
+                $"R/R: 1:{(reward / risk):N2}\n" +
+                $"Score B/S: {buyScore}/{sellScore}\n" +
+                $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
+                $"AI/News: {aiScore} ({aiReason})\n\n" +
+                $"اگر خریدی دکمه زیر را بزن:";
+
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            var keyboard = new InlineKeyboardMarkup(new[]
             {
-                decision = "BUY";
-            }
-            else if (!newsBlocksSell &&
-                     bothBearish && sellScore >= 7 && sellScore >= buyScore + 3 &&
-                     a15.Rsi > 40 && a1h.Rsi > 35)
+            new[]
             {
-                decision = "SELL";
+                InlineKeyboardButton.WithCallbackData(
+                    "✅ خریدم",
+                    $"bought|{symbol}|{price.ToString(inv)}|{stopLoss.ToString(inv)}|{takeProfit.ToString(inv)}"),
+                InlineKeyboardButton.WithCallbackData("❌ بی‌خیال", $"skip|{symbol}")
             }
+        });
 
-            if (decision == "WAIT") return null;
-
-            Console.WriteLine($"{symbol,-12} | {price,12:N4} | Buy:{buyScore} Sell:{sellScore} | {decision}");
-            SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, decision);
-
-            if (decision == "BUY")
-            {
-                decimal stopLoss;
-                if (support > 0 && support < price)
-                {
-                    stopLoss = support * 0.997m;
-                    decimal maxRiskSl = price * 0.98m;
-                    if (stopLoss < maxRiskSl) stopLoss = maxRiskSl;
-                }
-                else stopLoss = price * 0.985m;
-
-                decimal takeProfit;
-                if (resistance > 0 && resistance > price)
-                {
-                    takeProfit = resistance * 0.997m;
-                    decimal maxTp = price * 1.04m;
-                    if (takeProfit > maxTp) takeProfit = maxTp;
-                }
-                else takeProfit = price * 1.03m;
-
-                decimal risk = price - stopLoss;
-                decimal reward = takeProfit - price;
-                if (risk <= 0 || reward / risk < 1.2m)
-                {
-                    Console.WriteLine($"  Skip BUY {symbol}: bad R/R");
-                    return null;
-                }
-
-                decimal slPercent = (price - stopLoss) / price * 100;
-                decimal tpPercent = (takeProfit - price) / price * 100;
-
-                if (IsStablePair(symbol, price)) return null;
-
-                // جلوگیری از تکرار
-                if (HasPendingSignal(symbol)) return null;
-
-                TrackSignal(symbol, price, stopLoss, takeProfit);
-
-                var nobitexPrice = await GetNobitexLastPriceAsync(symbol);
-                decimal entryForUser = nobitexPrice ?? price; // اگر نوبیتکس نگرفت، بایننس
-
-                string text =
-                    $"🟢 BUY پیشنهاد {symbol}\n" +
-                    $"Entry (Nobitex): {entryForUser:N4}\n" +
-                    $"Ref Binance: {price:N4}\n" +
-                    $"Stop Loss: {stopLoss:N4} (-{slPercent:N2}%)\n" +
-                    $"Take Profit: {takeProfit:N4} (+{tpPercent:N2}%)\n" +
-                    $"R/R: 1:{(reward / risk):N2}\n" +
-                    $"Score B/S: {buyScore}/{sellScore}\n" +
-                    $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n\n" +
-                    $"AI/News Score: {aiScore} ({aiReason})\n" +
-                    $"اگر خریدی دکمه زیر را بزن:";
-
-                var keyboard = new InlineKeyboardMarkup(new[]
-                {
-                new[]
-                {
-                    InlineKeyboardButton.WithCallbackData("✅ خریدم",
-                        $"bought|{symbol}|{price}|{stopLoss}|{takeProfit}"),
-                    InlineKeyboardButton.WithCallbackData("❌ بی‌خیال",
-                        $"skip|{symbol}")
-                }
-            });
-
-                return (text, keyboard);
-            }
+            return (text, keyboard);
         }
         catch (Exception ex)
         {
-            if (ex.Message.Contains("rate") || ex.Message.Contains("429") || ex.Message.Contains("Too many"))
-            {
-                Console.WriteLine($"Rate limit on {symbol} → 60s wait");
+            Console.WriteLine($"Analyze {symbol}: {ex.Message}");
+            if (ex.Message.Contains("429") || ex.Message.Contains("rate") || ex.Message.Contains("Too many"))
                 await Task.Delay(60000);
-            }
+            return null;
         }
-
-        return null;
     }
 
     static async Task<bool> IsOllamaRunningAsync()
