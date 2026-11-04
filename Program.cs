@@ -438,18 +438,20 @@ class Program
         var parts = data.Split('|');
         if (parts.Length == 0) return "دستور نامعتبر";
 
-        if (parts[0] == "bought" && parts.Length >= 5)
+        if ((parts[0] == "long" || parts[0] == "short" || parts[0] == "bought") && parts.Length >= 5)
         {
+            string side = parts[0] == "short" ? "SHORT" : "LONG";
             string symbol = parts[1];
             decimal entry = decimal.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
             decimal sl = decimal.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture);
             decimal tp = decimal.Parse(parts[4], System.Globalization.CultureInfo.InvariantCulture);
+            int lev = parts.Length >= 6 && int.TryParse(parts[5], out var l) ? l : 1;
 
             if (HasOpenTrade(chatId, symbol))
                 return $"قبلاً معامله باز روی {symbol} داری.";
 
-            OpenTrade(chatId, symbol, entry, sl, tp);
-            return $"✅ ثبت شد: خرید {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}";
+            OpenTrade(chatId, symbol, entry, sl, tp, side, lev);
+            return $"✅ ثبت شد: {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\nLeverage: {lev}x";
         }
 
         if (parts[0] == "sold" && parts.Length >= 2)
@@ -459,18 +461,22 @@ class Program
             if (trades.Count == 0)
                 return $"معامله بازی برای {symbol} نیست.";
 
-            var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(symbol);
-            decimal exitPrice = ticker.Success ? ticker.Data.LastPrice : trades[0].EntryPrice;
+            var ticker = await GetNobitexLastPriceAsync(symbol);
+            decimal exitPrice = ticker ?? trades[0].EntryPrice;
 
             foreach (var t in trades)
-                CloseTrade(t.Id, exitPrice, "ManualSell");
+                CloseTrade(t.Id, exitPrice, "ManualClose");
 
-            decimal pnl = (exitPrice - trades[0].EntryPrice) / trades[0].EntryPrice * 100;
-            return $"✅ بسته شد: {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%";
+            var t0 = trades[0];
+            decimal pnl = t0.Side == "SHORT"
+                ? (t0.EntryPrice - exitPrice) / t0.EntryPrice * 100
+                : (exitPrice - t0.EntryPrice) / t0.EntryPrice * 100;
+
+            return $"✅ بسته شد: {t0.Side} {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%";
         }
 
         if (parts[0] == "skip")
-            return "لغو شد. معامله‌ای ثبت نشد.";
+            return "لغو شد.";
 
         return "دستور نامعتبر";
     }
@@ -583,80 +589,114 @@ class Program
 
             var sma50 = data1h.GetSma(50).Last().Sma;
             bool aboveSma50 = sma50 is not null && price >= (decimal)sma50.Value;
+            bool belowSma50 = sma50 is not null && price <= (decimal)sma50.Value;
 
             double distSup = support > 0 ? (double)((price - support) / price * 100) : 100;
+            double distRes = resistance > 0 ? (double)((resistance - price) / price * 100) : 100;
             bool nearSupport = distSup <= 2.0;
+            bool nearResistance = distRes <= 2.0;
 
             int buyScore = a15.BuyScore + a1h.BuyScore;
             int sellScore = a15.SellScore + a1h.SellScore;
 
             bool bothBullish = a15.BuyScore > a15.SellScore && a1h.BuyScore > a1h.SellScore;
+            bool bothBearish = a15.SellScore > a15.BuyScore && a1h.SellScore > a1h.BuyScore;
+
             if (bothBullish) buyScore += 2;
+            if (bothBearish) sellScore += 2;
             if (nearSupport) buyScore += 2;
+            if (nearResistance) sellScore += 2;
             if (aboveSma50) buyScore += 1;
+            if (belowSma50) sellScore += 1;
+
+            // سرعت: AI فقط وقتی نزدیک سیگنال هستیم
+            if (buyScore < 4 && sellScore < 4)
+                return null;
 
             var (aiScore, aiReason, _) = await GetNewsAiScoreAsync(symbol, buyScore, sellScore);
             if (aiScore > 0) buyScore += aiScore;
             if (aiScore < 0) sellScore += -aiScore;
-            if (aiScore <= -2) return null;
 
-            // دیباگ (اختیاری — بعداً می‌توانی حذف کنی)
-            Console.WriteLine(
-                $"{symbol,-12} p={price:N4} nearSup={nearSupport} above50={aboveSma50} " +
-                $"bothBull={bothBullish} B={buyScore} S={sellScore} RSI={a15.Rsi:N0}/{a1h.Rsi:N0} AI={aiScore}");
+            string? side = null;
 
-            // فیلتر میانی
-            if (buyScore < 6 || buyScore < sellScore + 2) return null;
-            if (a15.Rsi >= 65 || a1h.Rsi >= 70) return null;
-            if (!nearSupport && !aboveSma50) return null;
-            if (!bothBullish && !nearSupport) return null;
+            // LONG
+            if (aiScore > -2 &&
+                buyScore >= 6 && buyScore >= sellScore + 2 &&
+                a15.Rsi < 65 && a1h.Rsi < 70 &&
+                (nearSupport || aboveSma50) &&
+                (bothBullish || nearSupport))
+            {
+                side = "LONG";
+            }
+            // SHORT
+            else if (aiScore < 2 &&
+                     sellScore >= 6 && sellScore >= buyScore + 2 &&
+                     a15.Rsi > 35 && a1h.Rsi > 30 &&
+                     (nearResistance || belowSma50) &&
+                     (bothBearish || nearResistance))
+            {
+                side = "SHORT";
+            }
 
-            // SL / TP روی سطوح نوبیتکس
-            decimal stopLoss = (support > 0 && support < price)
-                ? support * 0.995m
-                : price * 0.985m;
-
-            if ((price - stopLoss) / price > 0.04m)
+            if (side == null)
                 return null;
 
-            decimal takeProfit;
-            if (resistance > 0 && resistance > price)
-                takeProfit = Math.Min(resistance * 0.997m, price * 1.03m);
+            decimal stopLoss, takeProfit;
+
+            if (side == "LONG")
+            {
+                stopLoss = (support > 0 && support < price) ? support * 0.995m : price * 0.985m;
+                takeProfit = (resistance > 0 && resistance > price)
+                    ? Math.Min(resistance * 0.997m, price * 1.03m)
+                    : price * 1.025m;
+            }
             else
-                takeProfit = price * 1.025m;
+            {
+                stopLoss = (resistance > 0 && resistance > price) ? resistance * 1.005m : price * 1.015m;
+                takeProfit = (support > 0 && support < price)
+                    ? Math.Max(support * 1.003m, price * 0.975m)
+                    : price * 0.975m;
+            }
 
-            decimal risk = price - stopLoss;
-            decimal reward = takeProfit - price;
-            if (risk <= 0 || reward / risk < 1.2m)
-                return null;
+            decimal risk = side == "LONG" ? (price - stopLoss) : (stopLoss - price);
+            decimal reward = side == "LONG" ? (takeProfit - price) : (price - takeProfit);
 
-            decimal slPercent = risk / price * 100;
-            decimal tpPercent = reward / price * 100;
+            if (risk <= 0 || reward / risk < 1.2m) return null;
+            if (risk / price > 0.04m) return null;
 
-            Console.WriteLine($"{symbol,-12} | {price,12:N4} | Buy:{buyScore} Sell:{sellScore} | BUY");
-            SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, "BUY");
+            decimal riskPercent = risk / price * 100;
+            decimal rewardPercent = reward / price * 100;
+            int leverage = SuggestLeverage(riskPercent);
+
+            Console.WriteLine($"{symbol,-12} | {price,12:N4} | {side} | B:{buyScore} S:{sellScore} | lev {leverage}x");
+            SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, side);
             TrackSignal(symbol, price, stopLoss, takeProfit);
 
+            string emoji = side == "LONG" ? "🟢" : "🔴";
             string text =
-                $"🟢 BUY پیشنهاد {symbol}\n" +
+                $"{emoji} {side} {symbol}\n" +
                 $"Entry: {price:N4} (Nobitex)\n" +
                 $"Support: {support:N4} | Resistance: {resistance:N4}\n" +
-                $"Stop Loss: {stopLoss:N4} (-{slPercent:N2}%)\n" +
-                $"Take Profit: {takeProfit:N4} (+{tpPercent:N2}%)\n" +
+                $"Stop Loss: {stopLoss:N4} ({(side == "LONG" ? "-" : "+")}{riskPercent:N2}%)\n" +
+                $"Take Profit: {takeProfit:N4} ({(side == "LONG" ? "+" : "-")}{rewardPercent:N2}%)\n" +
                 $"R/R: 1:{(reward / risk):N2}\n" +
+                $"اهرم پیشنهادی: {leverage}x (محافظه‌کارانه)\n" +
+                $"اسپات: فقط LONG معنا دارد | فیوچرز: LONG یا SHORT\n" +
                 $"Score B/S: {buyScore}/{sellScore}\n" +
                 $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
                 $"AI/News: {aiScore} ({aiReason})\n\n" +
-                $"اگر خریدی دکمه زیر را بزن:";
+                $"اگر وارد شدی دکمه را بزن:";
 
             var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string payload =
+                $"{side.ToLowerInvariant()}|{symbol}|{price.ToString(inv)}|{stopLoss.ToString(inv)}|{takeProfit.ToString(inv)}|{leverage}";
+
             var keyboard = new InlineKeyboardMarkup(new[]
             {
             new[]
             {
                 InlineKeyboardButton.WithCallbackData(
-                    "✅ خریدم",
-                    $"bought|{symbol}|{price.ToString(inv)}|{stopLoss.ToString(inv)}|{takeProfit.ToString(inv)}"),
+                    side == "LONG" ? "✅ ورود LONG" : "✅ ورود SHORT", payload),
                 InlineKeyboardButton.WithCallbackData("❌ بی‌خیال", $"skip|{symbol}")
             }
         });
@@ -671,6 +711,16 @@ class Program
             return null;
         }
     }
+
+    static int SuggestLeverage(decimal riskPercent)
+    {
+        // riskPercent = فاصله تا SL به درصد
+        if (riskPercent >= 3.0m) return 1;
+        if (riskPercent >= 2.0m) return 2;
+        if (riskPercent >= 1.0m) return 3;
+        return 2; // SL خیلی تنگ → اهرم بالا نده
+    }
+
 
     static async Task<bool> IsOllamaRunningAsync()
     {
@@ -969,9 +1019,9 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
     {
         string[] stables =
         {
-        "USDCUSDT","RLUSDUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT",
-        "USDPUSDT","USD1USDT","USDEUSDT","EURUSDT","AEURUSDT"
-    };
+            "USDCUSDT","RLUSDUSDT","FDUSDUSDT","TUSDUSDT","DAIUSDT",
+            "USDPUSDT","USD1USDT","USDEUSDT","EURUSDT","AEURUSDT"
+        };
         if (stables.Contains(symbol)) return true;
 
         // تقریبی: قیمت نزدیک 1 دلار
@@ -1043,19 +1093,22 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
     }
 
-    static void OpenTrade(long chatId, string symbol, decimal entry, decimal sl, decimal tp)
+    static void OpenTrade(long chatId, string symbol, decimal entry, decimal sl, decimal tp,
+    string side = "LONG", int leverage = 1)
     {
         using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-        INSERT INTO OpenTrades (ChatId, Symbol, EntryPrice, StopLoss, TakeProfit, Status)
-        VALUES ($c, $s, $e, $sl, $tp, 'Open')";
+        INSERT INTO OpenTrades (ChatId, Symbol, EntryPrice, StopLoss, TakeProfit, Status, Side, Leverage)
+        VALUES ($c, $s, $e, $sl, $tp, 'Open', $side, $lev)";
         cmd.Parameters.AddWithValue("$c", chatId);
         cmd.Parameters.AddWithValue("$s", symbol);
         cmd.Parameters.AddWithValue("$e", entry);
         cmd.Parameters.AddWithValue("$sl", sl);
         cmd.Parameters.AddWithValue("$tp", tp);
+        cmd.Parameters.AddWithValue("$side", side);
+        cmd.Parameters.AddWithValue("$lev", leverage);
         cmd.ExecuteNonQuery();
     }
 
@@ -1143,51 +1196,104 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static async Task CheckOpenTrades(BinanceRestClient client, TelegramBotClient bot)
     {
-        var trades = GetOpenTrades(); // همه کاربران
+        var trades = GetOpenTrades(); // همه کاربران، Status = Open
 
         foreach (var t in trades)
         {
             try
             {
-                var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(t.Symbol);
+                // قیمت از نوبیتکس (هم‌خوان با ورود)
+                decimal? live = await GetNobitexLastPriceAsync(t.Symbol);
                 await Task.Delay(150);
-                if (!ticker.Success) continue;
 
-                decimal price = ticker.Data.LastPrice;
-                decimal pnlPercent = (price - t.EntryPrice) / t.EntryPrice * 100;
+                if (live is null || live <= 0)
+                    continue;
 
-                if (price <= t.StopLoss)
+                decimal price = live.Value;
+                string side = string.IsNullOrWhiteSpace(t.Side) ? "LONG" : t.Side.ToUpperInvariant();
+
+                decimal pnlPercent = side == "SHORT"
+                    ? (t.EntryPrice - price) / t.EntryPrice * 100
+                    : (price - t.EntryPrice) / t.EntryPrice * 100;
+
+                bool hitSl;
+                bool hitTp;
+
+                if (side == "SHORT")
+                {
+                    hitSl = price >= t.StopLoss;
+                    hitTp = price <= t.TakeProfit;
+                }
+                else
+                {
+                    hitSl = price <= t.StopLoss;
+                    hitTp = price >= t.TakeProfit;
+                }
+
+                if (hitSl)
                 {
                     CloseTrade(t.Id, price, "StopLoss");
+
                     await bot.SendMessage(t.ChatId,
-                        $"🛑 STOP LOSS {t.Symbol}\nEntry: {t.EntryPrice:N4} → {price:N4}\nPnL: {pnlPercent:N2}%");
+                        $"🛑 STOP LOSS\n" +
+                        $"{side} {t.Symbol}\n" +
+                        $"Entry: {t.EntryPrice:N4}\n" +
+                        $"Exit: {price:N4}\n" +
+                        $"PnL: {pnlPercent:N2}%\n" +
+                        $"Leverage: {t.Leverage}x");
+
+                    Console.WriteLine($"SL: {side} {t.Symbol} chat={t.ChatId} pnl={pnlPercent:N2}%");
                 }
-                else if (price >= t.TakeProfit)
+                else if (hitTp)
                 {
                     CloseTrade(t.Id, price, "TakeProfit");
+
                     await bot.SendMessage(t.ChatId,
-                        $"🎯 TAKE PROFIT {t.Symbol}\nEntry: {t.EntryPrice:N4} → {price:N4}\nPnL: {pnlPercent:N2}%");
+                        $"🎯 TAKE PROFIT\n" +
+                        $"{side} {t.Symbol}\n" +
+                        $"Entry: {t.EntryPrice:N4}\n" +
+                        $"Exit: {price:N4}\n" +
+                        $"PnL: {pnlPercent:N2}%\n" +
+                        $"Leverage: {t.Leverage}x");
+
+                    Console.WriteLine($"TP: {side} {t.Symbol} chat={t.ChatId} pnl={pnlPercent:N2}%");
                 }
-                else if (pnlPercent <= -1.0m)
+                else
                 {
-                    await bot.SendMessage(t.ChatId,
-                        $"⚠️ نزدیک حد ضرر {t.Symbol}\nNow: {price:N4} | PnL: {pnlPercent:N2}%");
-                }
-                else if (pnlPercent >= 2.0m)
-                {
-                    var keyboard = new InlineKeyboardMarkup(new[]
+                    // هشدار نزدیک بودن — بدون بستن معامله
+                    if (pnlPercent <= -1.0m)
                     {
-                    new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData("✅ فروختم", $"sold|{t.Symbol}")
+                        await bot.SendMessage(t.ChatId,
+                            $"⚠️ نزدیک حد ضرر\n" +
+                            $"{side} {t.Symbol}\n" +
+                            $"Now: {price:N4}\n" +
+                            $"PnL: {pnlPercent:N2}%\n" +
+                            $"SL: {t.StopLoss:N4} | TP: {t.TakeProfit:N4}");
                     }
-                });
-                    await bot.SendMessage(t.ChatId,
-                        $"📈 در سود {t.Symbol}\nNow: {price:N4} | PnL: {pnlPercent:N2}%",
-                        replyMarkup: keyboard);
+                    else if (pnlPercent >= 2.0m)
+                    {
+                        var keyboard = new InlineKeyboardMarkup(new[]
+                        {
+                        new[]
+                        {
+                            InlineKeyboardButton.WithCallbackData("✅ بستم", $"sold|{t.Symbol}")
+                        }
+                    });
+
+                        await bot.SendMessage(t.ChatId,
+                            $"📈 در سود\n" +
+                            $"{side} {t.Symbol}\n" +
+                            $"Now: {price:N4}\n" +
+                            $"PnL: {pnlPercent:N2}%\n" +
+                            $"SL: {t.StopLoss:N4} | TP: {t.TakeProfit:N4}",
+                            replyMarkup: keyboard);
+                    }
                 }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"CheckOpenTrades {t.Symbol}: {ex.Message}");
+            }
         }
     }
 
@@ -1199,30 +1305,24 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
         var tickersResult = await client.SpotApi.ExchangeData.GetTickersAsync();
         if (!tickersResult.Success)
-            return [.. nobitex.Take(40)];
+            return nobitex.Take(20).ToList();
 
-        var stablecoins = new HashSet<string>
+        var stablecoins = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
     {
-        "USDCUSDT", "TUSDUSDT", "BUSDUSDT", "DAIUSDT", "FDUSDUSDT",
-        "USDPUSDT", "USDDUSDT", "USD1USDT", "EURUSDT", "AEURUSDT", "RLUSDUSDT"
+        "USDCUSDT","TUSDUSDT","BUSDUSDT","DAIUSDT","FDUSDUSDT",
+        "USDPUSDT","USDDUSDT","USD1USDT","EURUSDT","AEURUSDT","RLUSDUSDT"
     };
 
-        var list = tickersResult.Data
+        return tickersResult.Data
             .Where(t => t.Symbol.EndsWith("USDT"))
-            .Where(t => nobitex.Contains(t.Symbol))                 // فقط نوبیتکس
+            .Where(t => nobitex.Contains(t.Symbol))
             .Where(t => !stablecoins.Contains(t.Symbol))
             .Where(t => !t.Symbol.Contains("UP") && !t.Symbol.Contains("DOWN")
                      && !t.Symbol.Contains("BULL") && !t.Symbol.Contains("BEAR"))
             .OrderByDescending(t => t.QuoteVolume)
-            .Take(40)
+            .Take(20)
             .Select(t => t.Symbol)
             .ToList();
-
-        Console.WriteLine("Symbols (Binance ∩ Nobitex):");
-        foreach (var s in list)
-            Console.WriteLine("  " + s);
-
-        return list;
     }
 
     static async Task<List<Quote>?> GetNobitexQuotesAsync(string symbol, string resolution, int candleCount)
@@ -1452,6 +1552,8 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         public decimal EntryPrice { get; set; }
         public decimal StopLoss { get; set; }
         public decimal TakeProfit { get; set; }
+        public string Side { get; set; } = "LONG";
+        public int Leverage { get; set; } = 1;
     }
 
     class SignalTrack
