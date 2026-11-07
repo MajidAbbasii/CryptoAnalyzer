@@ -117,7 +117,7 @@ class Program
                 if (buySignals.Count == 0)
                     Console.WriteLine("No BUY signals this round.");
 
-                Console.WriteLine($"Next run at {DateTime.Now.AddMinutes(5):HH:mm}");
+                Console.WriteLine($"Next run at {DateTime.Now.AddMinutes(3):HH:mm}");
             }
             catch (Exception ex)
             {
@@ -132,7 +132,7 @@ class Program
                 }
             }
 
-            await Task.Delay(TimeSpan.FromMinutes(5));
+            await Task.Delay(TimeSpan.FromMinutes(3));
         }
     }
 
@@ -219,10 +219,12 @@ class Program
 
     static async Task<NobitexOrderResult> PlaceNobitexMarginOrderAsync(
     string symbol,
-    string side,       // LONG یا SHORT
+    string side,
     int leverage,
-    decimal amountSrc, // مقدار ارز پایه (مثلاً btc)
-    decimal price)     // قیمت با واحد dstCurrency
+    decimal amountSrc,
+    decimal price,
+    decimal stopLoss,
+    decimal takeProfit)
     {
         if ((string.IsNullOrWhiteSpace(NobitexApiKey) || string.IsNullOrWhiteSpace(NobitexApiSecret)))
         {
@@ -243,7 +245,7 @@ class Program
         // اول همان جفت (مثلاً usdt)، اگر MarginClosed بود و usdt بود یک‌بار rls را امتحان نکن
         // مگر قیمت را به ریال تبدیل کرده باشی — پس اینجا فقط همان جفت را می‌زنیم
         return await PlaceNobitexMarginOrderCoreAsync(
-            pair.Value.Src, pair.Value.Dst, orderType, leverage, amountSrc, price);
+            pair.Value.Src, pair.Value.Dst, orderType, leverage, amountSrc, price, stopLoss, takeProfit);
     }
 
     static async Task<NobitexOrderResult> PlaceNobitexMarginOrderCoreAsync(
@@ -252,21 +254,25 @@ class Program
         string orderType, // buy / sell
         int leverage,
         decimal amountSrc,
-        decimal price)
+        decimal price,
+        decimal stopLoss,
+        decimal takeProfit)
     {
         var inv = System.Globalization.CultureInfo.InvariantCulture;
 
         // JSON فشرده — عین همین باید امضا شود
         string json =
-            "{" +
-            $"\"srcCurrency\":\"{src}\"," +
-            $"\"dstCurrency\":\"{dst}\"," +
-            $"\"type\":\"{orderType}\"," +
-            $"\"execution\":\"limit\"," +
-            $"\"leverage\":\"{leverage.ToString(inv)}\"," +
-            $"\"amount\":\"{amountSrc.ToString(inv)}\"," +
-            $"\"price\":\"{price.ToString(inv)}\"" +
-            "}";
+     "{" +
+     $"\"srcCurrency\":\"{src}\"," +
+     $"\"dstCurrency\":\"{dst}\"," +
+     $"\"type\":\"{orderType}\"," +
+     "\"mode\":\"oco\"," +
+     $"\"leverage\":\"{leverage.ToString(inv)}\"," +
+     $"\"amount\":\"{amountSrc.ToString(inv)}\"," +
+     $"\"price\":\"{takeProfit.ToString(inv)}\"," +
+     $"\"stopPrice\":\"{stopLoss.ToString(inv)}\"," +
+     $"\"stopLimitPrice\":\"{stopLoss.ToString(inv)}\"" +
+     "}";
 
         try
         {
@@ -450,14 +456,25 @@ WHERE Symbol=$s AND Status='Pending'";
             return (symbol[..^3].ToLowerInvariant(), "rls");
         return null;
     }
-
+    static HttpClient CreateNobitexPublicHttp()
+    {
+        var handler = new HttpClientHandler
+        {
+            UseProxy = false,
+            Proxy = null
+        };
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+        http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
+        http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+        return http;
+    }
     static async Task<HashSet<string>> GetNobitexUsdtSymbolsAsync()
     {
         var set = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         try
         {
-            using var http = new HttpClient { Timeout = TimeSpan.FromSeconds(20) };
+            using var http = CreateNobitexPublicHttp();
             // لیست همه بازارها
             var json = await http.GetStringAsync("https://apiv2.nobitex.ir/v3/orderbook/all");
 
@@ -909,7 +926,13 @@ WHERE Symbol=$s AND Status='Pending'";
                 : pend.Entry * 1.005m;
 
             var order = await PlaceNobitexMarginOrderAsync(
-                pend.Symbol, pend.Side, lev, amountSrc, limitPrice);
+    pend.Symbol,
+    pend.Side,
+    lev,
+    amountSrc,
+    limitPrice,
+    pend.StopLoss,
+    pend.TakeProfit);
 
             PendingOrders.Remove(chatId);
 
