@@ -1,4 +1,5 @@
-﻿using Binance.Net.Clients;
+﻿using System.Text;
+using Binance.Net.Clients;
 using Binance.Net.Enums;
 using Microsoft.Data.Sqlite;
 using Skender.Stock.Indicators;
@@ -10,6 +11,15 @@ class Program
     const string OllamaModel = "llama3.2:latest";
     const string OllamaUrl = "http://127.0.0.1:11434";
     const string TelegramToken = "8651996991:AAFn4VOg06S6SM5G82Cni5kygjyi_i-CdE0";
+    static readonly string NobitexBaseUrl = "https://apiv2.nobitex.ir";
+    static decimal UsdtTomanRate = 276_000m;
+    static readonly Dictionary<string, string> SignalPayloads = new();
+    static readonly Dictionary<long, PendingOrder> PendingOrders = new();
+
+    static readonly string NobitexApiKey =
+        Environment.GetEnvironmentVariable("API_KEY") ?? "";
+    static readonly string NobitexApiSecret =
+        Environment.GetEnvironmentVariable("SECRET_KEY") ?? "";
 
     static async Task Main(string[] args)
     {
@@ -124,6 +134,321 @@ class Program
 
             await Task.Delay(TimeSpan.FromMinutes(5));
         }
+    }
+
+    static byte[] FromUrlSafeBase64(string s)
+    {
+        s = s.Replace('-', '+').Replace('_', '/');
+        switch (s.Length % 4)
+        {
+            case 2: s += "=="; break;
+            case 3: s += "="; break;
+        }
+        return Convert.FromBase64String(s);
+    }
+
+    static string ToUrlSafeBase64(byte[] data) =>
+        Convert.ToBase64String(data).TrimEnd('=').Replace('+', '-').Replace('/', '_');
+
+    static string SignNobitex(string timestamp, string method, string fullPath, string rawBody)
+    {
+        // payload = timestamp + METHOD + full_path + raw_body
+        string payload = timestamp + method.ToUpperInvariant() + fullPath + (rawBody ?? "");
+        byte[] msg = Encoding.UTF8.GetBytes(payload);
+        byte[] sk = FromUrlSafeBase64(NobitexApiSecret);
+
+        // NSec Ed25519
+        var algorithm = NSec.Cryptography.SignatureAlgorithm.Ed25519;
+        var key = NSec.Cryptography.Key.Import(
+            algorithm,
+            sk,
+            NSec.Cryptography.KeyBlobFormat.RawPrivateKey);
+
+        byte[] sig = algorithm.Sign(key, msg);
+        return ToUrlSafeBase64(sig);
+    }
+
+    static async Task<(int Status, string Body)> NobitexSendAsync(
+        HttpMethod method, string fullPath, string? jsonBody)
+    {
+        string rawBody = jsonBody ?? "";
+        string url = NobitexBaseUrl + fullPath;
+
+        using var handler = new HttpClientHandler { UseProxy = false, Proxy = null };
+        using var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+        http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
+        http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+
+        using var req = new HttpRequestMessage(method, url);
+
+        if (!string.IsNullOrWhiteSpace(NobitexApiKey) && !string.IsNullOrWhiteSpace(NobitexApiSecret))
+        {
+            // حالت API Key (مستند جدید)
+            string ts = DateTimeOffset.UtcNow.ToUnixTimeSeconds().ToString();
+            string sig = SignNobitex(ts, method.Method, fullPath, rawBody);
+            req.Headers.TryAddWithoutValidation("Nobitex-Key", NobitexApiKey);
+            req.Headers.TryAddWithoutValidation("Nobitex-Timestamp", ts);
+            req.Headers.TryAddWithoutValidation("Nobitex-Signature", sig);
+        }
+        else
+        {
+            return (0, "NOBITEX_TOKEN یا API_KEY/SECRET تنظیم نشده");
+        }
+
+        if (method == HttpMethod.Post || method == HttpMethod.Put)
+            req.Content = new StringContent(rawBody, Encoding.UTF8, "application/json");
+
+        var resp = await http.SendAsync(req);
+        string body = await resp.Content.ReadAsStringAsync();
+        Console.WriteLine($"Nobitex {(int)resp.StatusCode} {fullPath} {body}");
+        return ((int)resp.StatusCode, body);
+    }
+
+    static string StorePayload(string fullPayload)
+    {
+        string id = Guid.NewGuid().ToString("N")[..12];
+        SignalPayloads[id] = fullPayload;
+
+        if (SignalPayloads.Count > 200)
+        {
+            foreach (var old in SignalPayloads.Keys.Take(50).ToList())
+                SignalPayloads.Remove(old);
+        }
+        return id;
+    }
+
+    static async Task<NobitexOrderResult> PlaceNobitexMarginOrderAsync(
+    string symbol,
+    string side,       // LONG یا SHORT
+    int leverage,
+    decimal amountSrc, // مقدار ارز پایه (مثلاً btc)
+    decimal price)     // قیمت با واحد dstCurrency
+    {
+        if ((string.IsNullOrWhiteSpace(NobitexApiKey) || string.IsNullOrWhiteSpace(NobitexApiSecret)))
+        {
+            return new NobitexOrderResult
+            {
+                Ok = false,
+                Error = "NOBITEX_TOKEN یا NOBITEX_API_KEY/SECRET تنظیم نشده"
+            };
+        }
+
+        var pair = ParseNobitexPair(symbol);
+        if (pair is null)
+            return new NobitexOrderResult { Ok = false, Error = $"نماد نامعتبر: {symbol}" };
+
+        string orderType = side.Equals("SHORT", StringComparison.OrdinalIgnoreCase) ? "sell" : "buy";
+        leverage = Math.Clamp(leverage, 1, 5);
+
+        // اول همان جفت (مثلاً usdt)، اگر MarginClosed بود و usdt بود یک‌بار rls را امتحان نکن
+        // مگر قیمت را به ریال تبدیل کرده باشی — پس اینجا فقط همان جفت را می‌زنیم
+        return await PlaceNobitexMarginOrderCoreAsync(
+            pair.Value.Src, pair.Value.Dst, orderType, leverage, amountSrc, price);
+    }
+
+    static async Task<NobitexOrderResult> PlaceNobitexMarginOrderCoreAsync(
+        string src,
+        string dst,
+        string orderType, // buy / sell
+        int leverage,
+        decimal amountSrc,
+        decimal price)
+    {
+        var inv = System.Globalization.CultureInfo.InvariantCulture;
+
+        // JSON فشرده — عین همین باید امضا شود
+        string json =
+            "{" +
+            $"\"srcCurrency\":\"{src}\"," +
+            $"\"dstCurrency\":\"{dst}\"," +
+            $"\"type\":\"{orderType}\"," +
+            $"\"execution\":\"limit\"," +
+            $"\"leverage\":\"{leverage.ToString(inv)}\"," +
+            $"\"amount\":\"{amountSrc.ToString(inv)}\"," +
+            $"\"price\":\"{price.ToString(inv)}\"" +
+            "}";
+
+        try
+        {
+            var (status, raw) = await NobitexSendAsync(HttpMethod.Post, "/margin/orders/add", json);
+
+            if (status == 0 || raw.StartsWith("NOBITEX_", StringComparison.Ordinal))
+                return new NobitexOrderResult { Ok = false, Error = raw, Raw = raw };
+
+            if (string.IsNullOrWhiteSpace(raw))
+                return new NobitexOrderResult { Ok = false, Error = $"HTTP {status} empty body" };
+
+            using var doc = System.Text.Json.JsonDocument.Parse(raw);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("status", out var st) && st.GetString() == "ok")
+            {
+                long? id = null;
+                decimal? avg = null;
+
+                if (root.TryGetProperty("order", out var order))
+                {
+                    if (order.TryGetProperty("id", out var idEl) && idEl.TryGetInt64(out var oid))
+                        id = oid;
+
+                    if (order.TryGetProperty("averagePrice", out var ap) &&
+                        decimal.TryParse(ap.GetString(),
+                            System.Globalization.NumberStyles.Any, inv, out var apv) &&
+                        apv > 0)
+                    {
+                        avg = apv;
+                    }
+                }
+
+                return new NobitexOrderResult
+                {
+                    Ok = true,
+                    OrderId = id,
+                    FillPrice = avg ?? price,
+                    Raw = raw
+                };
+            }
+
+            string code = root.TryGetProperty("code", out var c) ? c.GetString() ?? "" : "";
+            string msg = root.TryGetProperty("message", out var m) ? m.GetString() ?? raw : raw;
+
+            string friendly = code switch
+            {
+                "MarginClosed" =>
+                    "تعهدی این بازار الان روی نوبیتکس بسته است (MarginClosed). " +
+                    "در سایت نوبیتکس بخش تعهدی همان نماد را چک کن یا جفت دیگر (مثلاً RLS) را ببین.",
+                "InsufficientBalance" =>
+                    "موجودی کیف تعهدی کافی نیست. از اسپات به کیف تعهدی منتقل کن.",
+                "InvalidMarketPair" =>
+                    "این جفت‌ارز در نوبیتکس معتبر نیست.",
+                "UnsupportedMarginSrc" =>
+                    "این رمزارز برای تعهدی پشتیبانی نمی‌شود.",
+                "SmallOrder" =>
+                    "حجم سفارش خیلی کوچک است. مبلغ تومان را بیشتر کن.",
+                "LeverageTooHigh" =>
+                    "اهرم بالاتر از سقف مجاز این بازار است. اهرم را کم کن.",
+                "BadPrice" =>
+                    "قیمت سفارش از نظر نوبیتکس نامعتبر است.",
+                "ExceedDlegationLimit" =>
+                    "از سقف وکالت باقی‌مانده بیشتر شده است.",
+                "TradeLimitation" =>
+                    "سطح احراز یا محدودیت حساب اجازه معامله نمی‌دهد.",
+                "AmountUnavailable" =>
+                    "در استخر وکالت، مقدار کافی برای فروش تعهدی نیست.",
+                _ => msg
+            };
+
+            if (msg.Contains("30 second", StringComparison.OrdinalIgnoreCase) ||
+                msg.Contains("timestamp", StringComparison.OrdinalIgnoreCase))
+            {
+                friendly += " | ساعت ویندوز را Sync کن (UTC).";
+            }
+
+            return new NobitexOrderResult
+            {
+                Ok = false,
+                Error = $"HTTP {status} | {code} | {friendly}",
+                Raw = raw
+            };
+        }
+        catch (Exception ex)
+        {
+            return new NobitexOrderResult { Ok = false, Error = ex.Message };
+        }
+    }
+
+    /// <summary>
+    /// اختیاری: ببین این نماد در بازار تعهدی هست یا نه
+    /// </summary>
+    static async Task<string> CheckMarginMarketAsync(string symbol)
+    {
+        var pair = ParseNobitexPair(symbol);
+        if (pair is null) return "نماد نامعتبر";
+
+        var (status, raw) = await NobitexSendAsync(HttpMethod.Get, "/margin/markets/list", null);
+        if (status != 200)
+            return $"لیست بازارها گرفته نشد: HTTP {status}\n{raw}";
+
+        // کلیدها معمولاً شبیه BTCUSDT یا BTCIRT هستند
+        string keyUsdt = $"{pair.Value.Src.ToUpperInvariant()}USDT";
+        string keyIrt = $"{pair.Value.Src.ToUpperInvariant()}IRT";
+
+        try
+        {
+            using var doc = System.Text.Json.JsonDocument.Parse(raw);
+            if (!doc.RootElement.TryGetProperty("markets", out var markets))
+                return raw;
+
+            var sb = new StringBuilder();
+            foreach (var name in new[] { keyUsdt, keyIrt, symbol.ToUpperInvariant() })
+            {
+                if (markets.TryGetProperty(name, out var m))
+                {
+                    sb.AppendLine($"✅ پیدا شد: {name}");
+                    sb.AppendLine(m.ToString());
+                }
+            }
+
+            return sb.Length > 0 ? sb.ToString() : $"در لیست تعهدی چیزی شبیه {keyUsdt}/{keyIrt} دیده نشد.\nبخشی از پاسخ:\n{(raw.Length > 500 ? raw[..500] : raw)}";
+        }
+        catch
+        {
+            return raw;
+        }
+    }
+
+    static bool HasPendingSignal(string symbol)
+    {
+        // اگر SignalTracks داری از DB بخوان؛ وگرنه false
+        try
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=crypto_analyzer.db");
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT COUNT(1) FROM SignalTracks
+WHERE Symbol=$s AND Status='Pending'";
+            cmd.Parameters.AddWithValue("$s", symbol);
+            var n = Convert.ToInt32(cmd.ExecuteScalar());
+            return n > 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    static bool TryGetPayload(string id, out string full)
+    {
+        if (SignalPayloads.TryGetValue(id, out full!))
+        {
+            SignalPayloads.Remove(id);
+            return true;
+        }
+        full = "";
+        return false;
+    }
+
+    static HttpClient CreateNobitexHttp()
+    {
+        var handler = new HttpClientHandler { UseProxy = false, Proxy = null };
+        var http = new HttpClient(handler) { Timeout = TimeSpan.FromSeconds(30) };
+        http.DefaultRequestHeaders.TryAddWithoutValidation("User-Agent", "Mozilla/5.0");
+        http.DefaultRequestHeaders.TryAddWithoutValidation("Accept", "application/json");
+
+        return http;
+    }
+
+    static (string Src, string Dst)? ParseNobitexPair(string symbol)
+    {
+        symbol = symbol.ToUpperInvariant();
+        if (symbol.EndsWith("USDT") && symbol.Length > 4)
+            return (symbol[..^4].ToLowerInvariant(), "usdt");
+        if (symbol.EndsWith("IRT") && symbol.Length > 3)
+            return (symbol[..^3].ToLowerInvariant(), "rls");
+        if (symbol.EndsWith("RLS") && symbol.Length > 3)
+            return (symbol[..^3].ToLowerInvariant(), "rls");
+        return null;
     }
 
     static async Task<HashSet<string>> GetNobitexUsdtSymbolsAsync()
@@ -420,6 +745,55 @@ class Program
                         continue;
                     }
 
+                    if (PendingOrders.TryGetValue(userChatId, out var pending) &&
+    pending.BudgetToman == null)
+                    {
+                        if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase))
+                        {
+                            PendingOrders.Remove(userChatId);
+                            await bot.SendMessage(userChatId, "لغو شد.");
+                            continue;
+                        }
+
+                        var raw = text.Replace(",", "").Replace("،", "").Replace(" ", "").Trim();
+
+                        if (!decimal.TryParse(raw,
+                                System.Globalization.NumberStyles.Any,
+                                System.Globalization.CultureInfo.InvariantCulture,
+                                out var toman) || toman < 50_000m)
+                        {
+                            await bot.SendMessage(userChatId,
+                                "عدد معتبر نیست.\nمثال: 300000\nحداقل ۵۰٬۰۰۰ تومان\nلغو: /cancel");
+                            continue;
+                        }
+
+                        pending.BudgetToman = toman;
+                        decimal approxUsdt = toman / UsdtTomanRate;
+
+                        var kb = new InlineKeyboardMarkup(new[]
+                        {
+        new[]
+        {
+            InlineKeyboardButton.WithCallbackData("✅ تأیید نهایی", "confirm_pending"),
+            InlineKeyboardButton.WithCallbackData("❌ انصراف", "cancel_pending")
+        }
+    });
+
+                        await bot.SendMessage(
+                            userChatId,
+                            $"⚠️ تأیید سفارش تعهدی نوبیتکس\n" +
+                            $"{pending.Side} {pending.Symbol}\n" +
+                            $"مبلغ: {toman:N0} تومان\n" +
+                            $"≈ {approxUsdt:N2} USDT (نرخ {UsdtTomanRate:N0})\n" +
+                            $"اهرم: {pending.Leverage}x\n" +
+                            $"Entry≈ {pending.Entry:N4}\n" +
+                            $"SL: {pending.StopLoss:N4} | TP: {pending.TakeProfit:N4}\n\n" +
+                            $"اگر درست است تأیید نهایی را بزن.",
+                            replyMarkup: kb);
+
+                        continue; // خیلی مهم
+                    }
+
                     var reply = await HandleUserCommand(userChatId, text, restClient);
                     if (!string.IsNullOrEmpty(reply))
                         await bot.SendMessage(userChatId, reply);
@@ -435,9 +809,126 @@ class Program
 
     static async Task<string> HandleCallback(long chatId, string data, BinanceRestClient client)
     {
-        var parts = data.Split('|');
-        if (parts.Length == 0) return "دستور نامعتبر";
+        if (string.IsNullOrWhiteSpace(data))
+            return "دستور نامعتبر";
 
+        // ----- دکمه‌های کوتاه exec_xxx / note_xxx -----
+        if (data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase) ||
+            data.StartsWith("note_", StringComparison.OrdinalIgnoreCase))
+        {
+            bool isExec = data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase);
+            string id = data[(data.IndexOf('_') + 1)..];
+
+            if (!TryGetPayload(id, out var full))
+                return "این سیگنال منقضی شده. منتظر سیگنال جدید بمان.";
+
+            // full = long|SYMBOL|entry|sl|tp|lev
+            var p = full.Split('|');
+            if (p.Length < 6)
+                return "داده سیگنال ناقص است.";
+
+            string side = p[0].Equals("short", StringComparison.OrdinalIgnoreCase) ? "SHORT" : "LONG";
+            string symbol = p[1];
+            decimal entry = decimal.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture);
+            decimal sl = decimal.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture);
+            decimal tp = decimal.Parse(p[4], System.Globalization.CultureInfo.InvariantCulture);
+            int lev = int.TryParse(p[5], out var lv) ? Math.Min(lv, 3) : 1;
+
+            if (isExec)
+            {
+                PendingOrders[chatId] = new PendingOrder
+                {
+                    Side = side,
+                    Symbol = symbol,
+                    Entry = entry,
+                    StopLoss = sl,
+                    TakeProfit = tp,
+                    Leverage = lev,
+                    BudgetToman = null
+                };
+
+                return
+                    $"💰 {side} {symbol}\n" +
+                    $"Entry≈ {entry:N4}\n\n" +
+                    $"چقدر تومان می‌خوای درگیر کنی؟\n" +
+                    $"فقط عدد بفرست، مثال:\n300000\n\n" +
+                    $"نرخ تقریبی تتر: {UsdtTomanRate:N0} تومان\n" +
+                    $"(تغییر نرخ: /rate 95000)\n" +
+                    $"لغو: /cancel";
+            }
+
+            // note = فقط یادداشت در ربات
+            if (HasOpenTrade(chatId, symbol))
+                return $"قبلاً معامله باز روی {symbol} داری.";
+
+            OpenTrade(chatId, symbol, entry, sl, tp, side, lev);
+            return $"📝 یادداشت شد (بدون سفارش صرافی)\n{side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}";
+        }
+
+        if (data.StartsWith("skip_", StringComparison.OrdinalIgnoreCase))
+            return "لغو شد.";
+
+        if (data.Equals("cancel_pending", StringComparison.OrdinalIgnoreCase))
+        {
+            PendingOrders.Remove(chatId);
+            return "لغو شد.";
+        }
+
+        // ----- بقیه با | -----
+        var parts = data.Split('|');
+        if (parts.Length == 0)
+            return "دستور نامعتبر";
+
+        if (parts[0] == "skip")
+            return "لغو شد.";
+
+        if (parts[0] == "confirm_pending")
+        {
+            if (!PendingOrders.TryGetValue(chatId, out var pend) || pend.BudgetToman is null)
+                return "سفارش معلقی نیست. دوباره از سیگنال شروع کن.";
+
+            if (UsdtTomanRate <= 0)
+                return "نرخ تتر نامعتبر است. با /rate تنظیم کن.";
+
+            if (HasOpenTrade(chatId, pend.Symbol))
+            {
+                PendingOrders.Remove(chatId);
+                return $"قبلاً معامله باز روی {pend.Symbol} داری.";
+            }
+
+            decimal usdtBudget = pend.BudgetToman.Value / UsdtTomanRate;
+            int lev = Math.Clamp(pend.Leverage, 1, 3);
+            decimal notional = usdtBudget * lev;
+            decimal amountSrc = Math.Round(notional / pend.Entry, 6);
+
+            if (amountSrc <= 0)
+                return "حجم صفر شد.";
+
+            decimal limitPrice = pend.Side == "SHORT"
+                ? pend.Entry * 0.995m
+                : pend.Entry * 1.005m;
+
+            var order = await PlaceNobitexMarginOrderAsync(
+                pend.Symbol, pend.Side, lev, amountSrc, limitPrice);
+
+            PendingOrders.Remove(chatId);
+
+            if (!order.Ok)
+                return $"❌ سفارش ناموفق:\n{order.Error}";
+
+            decimal fill = order.FillPrice ?? pend.Entry;
+            OpenTrade(chatId, pend.Symbol, fill, pend.StopLoss, pend.TakeProfit, pend.Side, lev);
+
+            return $"✅ سفارش تعهدی ارسال شد\n" +
+                   $"{pend.Side} {pend.Symbol}\n" +
+                   $"مبلغ: {pend.BudgetToman:N0} تومان\n" +
+                   $"≈ {usdtBudget:N2} USDT | lev {lev}x\n" +
+                   $"amount={amountSrc}\n" +
+                   $"Fill≈ {fill:N4}\n" +
+                   $"OrderId: {order.OrderId}";
+        }
+
+        // سازگاری قدیمی: long| / short| / bought| → فقط یادداشت
         if ((parts[0] == "long" || parts[0] == "short" || parts[0] == "bought") && parts.Length >= 5)
         {
             string side = parts[0] == "short" ? "SHORT" : "LONG";
@@ -445,13 +936,13 @@ class Program
             decimal entry = decimal.Parse(parts[2], System.Globalization.CultureInfo.InvariantCulture);
             decimal sl = decimal.Parse(parts[3], System.Globalization.CultureInfo.InvariantCulture);
             decimal tp = decimal.Parse(parts[4], System.Globalization.CultureInfo.InvariantCulture);
-            int lev = parts.Length >= 6 && int.TryParse(parts[5], out var l) ? l : 1;
+            int lev = parts.Length >= 6 && int.TryParse(parts[5], out var l) ? Math.Min(l, 3) : 1;
 
             if (HasOpenTrade(chatId, symbol))
                 return $"قبلاً معامله باز روی {symbol} داری.";
 
             OpenTrade(chatId, symbol, entry, sl, tp, side, lev);
-            return $"✅ ثبت شد: {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\nLeverage: {lev}x";
+            return $"📝 ثبت شد (بدون سفارش صرافی): {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\nLeverage: {lev}x";
         }
 
         if (parts[0] == "sold" && parts.Length >= 2)
@@ -472,7 +963,8 @@ class Program
                 ? (t0.EntryPrice - exitPrice) / t0.EntryPrice * 100
                 : (exitPrice - t0.EntryPrice) / t0.EntryPrice * 100;
 
-            return $"✅ بسته شد: {t0.Side} {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%";
+            return $"✅ بسته شد: {t0.Side} {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%\n" +
+                   $"(اگر پوزیشن روی نوبیتکس باز است از صرافی هم ببند)";
         }
 
         if (parts[0] == "skip")
@@ -484,19 +976,60 @@ class Program
     static async Task<string> HandleUserCommand(long chatId, string text, BinanceRestClient client)
     {
         text = text.Trim();
+
+        // اگر فقط عدد فرستاده (مبلغ تومان) — اینجا پردازش نکن
+        // باید در ListenTelegramCommands با PendingOrders هندل شود
+        var maybeNumber = text.Replace(",", "").Replace("،", "").Replace(" ", "");
+        if (decimal.TryParse(maybeNumber,
+                System.Globalization.NumberStyles.Any,
+                System.Globalization.CultureInfo.InvariantCulture,
+                out _) &&
+            !text.StartsWith("/"))
+        {
+            if (PendingOrders.TryGetValue(chatId, out var pend) && pend.BudgetToman == null)
+            {
+                // اگر به‌اشتباه به اینجا رسید، همان منطق مبلغ
+                pend.BudgetToman = decimal.Parse(maybeNumber,
+                    System.Globalization.CultureInfo.InvariantCulture);
+
+                // فقط متن؛ دکمه را Listen بهتر می‌فرستد
+                return
+                    $"مبلغ {pend.BudgetToman:N0} تومان ثبت شد.\n" +
+                    $"اگر دکمه تأیید نیامد، دوباره روی سیگنال بزن یا در Listen بلوک Pending را فعال کن.";
+            }
+
+            return "برای ورود از دکمه سیگنال استفاده کن؛ بعد مبلغ را بفرست.\nلغو: /cancel";
+        }
+
         if (text.StartsWith("/")) text = text[1..];
 
         var parts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
         if (parts.Length == 0) return "";
 
-        string action = parts[0].ToLower();
+        string action = parts[0].ToLowerInvariant();
+
+        // /rate 95000
+        if (action == "rate")
+        {
+            if (parts.Length < 2 ||
+                !decimal.TryParse(parts[1].Replace(",", ""),
+                    System.Globalization.NumberStyles.Any,
+                    System.Globalization.CultureInfo.InvariantCulture,
+                    out var rate) || rate < 1000)
+            {
+                return $"نرخ فعلی تتر: {UsdtTomanRate:N0} تومان\nمثال: /rate";
+            }
+            UsdtTomanRate = rate;
+            return $"✅ نرخ تتر: {UsdtTomanRate:N0} تومان";
+        }
 
         if (action == "open")
         {
             var trades = GetOpenTrades(chatId);
             if (trades.Count == 0) return "معامله بازی نداری.";
             return "معاملات باز شما:\n" + string.Join("\n",
-                trades.Select(t => $"{t.Symbol} | Entry {t.EntryPrice:N4} | SL {t.StopLoss:N4} | TP {t.TakeProfit:N4}"));
+                trades.Select(t =>
+                    $"{t.Side} {t.Symbol} | Entry {t.EntryPrice:N4} | SL {t.StopLoss:N4} | TP {t.TakeProfit:N4} | lev {t.Leverage}x"));
         }
 
         if (action == "report")
@@ -505,10 +1038,16 @@ class Program
         if (action == "stats")
             return GetPerformanceStats(chatId);
 
-        if (parts.Length < 2)
-            return "فرمت:\n/bought BTCUSDT\n/sold BTCUSDT\n/open\n/stats";
+        if (action == "cancel")
+        {
+            PendingOrders.Remove(chatId);
+            return "سفارش معلق لغو شد.";
+        }
 
-        string symbol = parts[1].ToUpper();
+        if (parts.Length < 2)
+            return "فرمت:\n/bought BTCUSDT\n/sold BTCUSDT\n/open\n/stats\n/report\n/rate 95000";
+
+        string symbol = parts[1].ToUpperInvariant();
         if (!symbol.EndsWith("USDT")) symbol += "USDT";
 
         if (action == "bought")
@@ -523,14 +1062,14 @@ class Program
                 entry = manualPrice;
             else
             {
-                var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(symbol);
-                if (!ticker.Success) return $"قیمت {symbol} گرفته نشد.";
-                entry = ticker.Data.LastPrice;
+                var live = await GetNobitexLastPriceAsync(symbol);
+                if (live is null) return $"قیمت {symbol} گرفته نشد.";
+                entry = live.Value;
             }
 
             decimal sl = entry * 0.985m;
             decimal tp = entry * 1.03m;
-            OpenTrade(chatId, symbol, entry, sl, tp);
+            OpenTrade(chatId, symbol, entry, sl, tp, "LONG", 1);
             return $"✅ ثبت شد: خرید {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}";
         }
 
@@ -547,14 +1086,18 @@ class Program
                 exitPrice = manualExit;
             else
             {
-                var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(symbol);
-                exitPrice = ticker.Success ? ticker.Data.LastPrice : trades[0].EntryPrice;
+                var live = await GetNobitexLastPriceAsync(symbol);
+                exitPrice = live ?? trades[0].EntryPrice;
             }
 
             foreach (var t in trades)
                 CloseTrade(t.Id, exitPrice, "ManualSell");
 
-            decimal pnl = (exitPrice - trades[0].EntryPrice) / trades[0].EntryPrice * 100;
+            var t0 = trades[0];
+            decimal pnl = t0.Side == "SHORT"
+                ? (t0.EntryPrice - exitPrice) / t0.EntryPrice * 100
+                : (exitPrice - t0.EntryPrice) / t0.EntryPrice * 100;
+
             return $"✅ بسته شد: {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%";
         }
 
@@ -609,7 +1152,7 @@ class Program
             if (aboveSma50) buyScore += 1;
             if (belowSma50) sellScore += 1;
 
-            // سرعت: AI فقط وقتی نزدیک سیگنال هستیم
+            // سرعت: AI فقط نزدیک سیگنال
             if (buyScore < 4 && sellScore < 4)
                 return null;
 
@@ -680,24 +1223,32 @@ class Program
                 $"Stop Loss: {stopLoss:N4} ({(side == "LONG" ? "-" : "+")}{riskPercent:N2}%)\n" +
                 $"Take Profit: {takeProfit:N4} ({(side == "LONG" ? "+" : "-")}{rewardPercent:N2}%)\n" +
                 $"R/R: 1:{(reward / risk):N2}\n" +
-                $"اهرم پیشنهادی: {leverage}x (محافظه‌کارانه)\n" +
-                $"اسپات: فقط LONG معنا دارد | فیوچرز: LONG یا SHORT\n" +
+                $"اهرم پیشنهادی: {leverage}x\n" +
+                $"بازار: تعهدی نوبیتکس (LONG/SHORT)\n" +
                 $"Score B/S: {buyScore}/{sellScore}\n" +
                 $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
                 $"AI/News: {aiScore} ({aiReason})\n\n" +
-                $"اگر وارد شدی دکمه را بزن:";
+                $"اگر می‌خوای وارد شی، دکمه را بزن:";
 
             var inv = System.Globalization.CultureInfo.InvariantCulture;
-            string payload =
+            string fullPayload =
                 $"{side.ToLowerInvariant()}|{symbol}|{price.ToString(inv)}|{stopLoss.ToString(inv)}|{takeProfit.ToString(inv)}|{leverage}";
+
+            // callback_data کوتاه تا BUTTON_DATA_INVALID نشود
+            string id = StorePayload(fullPayload);
 
             var keyboard = new InlineKeyboardMarkup(new[]
             {
             new[]
             {
                 InlineKeyboardButton.WithCallbackData(
-                    side == "LONG" ? "✅ ورود LONG" : "✅ ورود SHORT", payload),
-                InlineKeyboardButton.WithCallbackData("❌ بی‌خیال", $"skip|{symbol}")
+                    side == "LONG" ? "⚡ تعهدی LONG" : "⚡ تعهدی SHORT",
+                    $"exec_{id}"),
+                InlineKeyboardButton.WithCallbackData("📝 فقط یادداشت", $"note_{id}")
+            },
+            new[]
+            {
+                InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
             }
         });
 
@@ -992,6 +1543,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
             OpenedAt TEXT DEFAULT CURRENT_TIMESTAMP,
             ClosedAt TEXT
         );";
+
         cmd.ExecuteNonQuery();
 
         Console.WriteLine("Multi-user database ready.");
@@ -1029,16 +1581,6 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
             return true;
 
         return false;
-    }
-
-    static bool HasPendingSignal(string symbol)
-    {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(1) FROM SignalTracks WHERE Symbol=$s AND Status='Pending'";
-        cmd.Parameters.AddWithValue("$s", symbol);
-        return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
     }
 
     static void SetUserActive(long chatId, bool active)
@@ -1417,41 +1959,35 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         })];
     }
 
-    static (int BuyScore, int SellScore, double Rsi) AnalyzeTimeframe(List<Quote> quotes)
+    static TfResult AnalyzeTimeframe(List<Skender.Stock.Indicators.Quote> quotes)
     {
-        int buy = 0, sell = 0;
-        var rsi = quotes.GetRsi(14).Last();
-        var macd = quotes.GetMacd(12, 26, 9).Last();
-        var sma20 = quotes.GetSma(20).Last();
-        var sma50 = quotes.GetSma(50).Last();
-        var last = quotes.Last();
-
-        if (rsi.Rsi <= 30) buy += 2;
-        else if (rsi.Rsi <= 40) buy += 1;
-        else if (rsi.Rsi >= 70) sell += 2;
-        else if (rsi.Rsi >= 60) sell += 1;
-
-        if (macd.Macd > macd.Signal && macd.Histogram > 0) buy += 1;
-        else if (macd.Macd < macd.Signal && macd.Histogram < 0) sell += 1;
-
-        if (Convert.ToDecimal(last.Close) > Convert.ToDecimal(sma20.Sma) && Convert.ToDecimal(sma20.Sma) > Convert.ToDecimal(sma50.Sma)) buy += 1;
-        else if (Convert.ToDecimal(last.Close) < Convert.ToDecimal(sma20.Sma) && Convert.ToDecimal(sma20.Sma) < Convert.ToDecimal(sma50.Sma)) sell += 1;
-
-        var avgVol = quotes.TakeLast(20).Average(q => q.Volume);
-        if (last.Volume > avgVol * 1.3m)
-        {
-            if (buy > sell) buy += 1;
-            if (sell > buy) sell += 1;
-        }
-
         var rsiList = quotes.GetRsi(14).ToList();
-        if (quotes.Count >= 6)
-        {
-            if (quotes[^1].Close < quotes[^6].Close && rsiList[^1].Rsi > rsiList[^6].Rsi) buy += 2;
-            if (quotes[^1].Close > quotes[^6].Close && rsiList[^1].Rsi < rsiList[^6].Rsi) sell += 2;
-        }
+        var macdList = quotes.GetMacd(12, 26, 9).ToList();
+        var sma20 = quotes.GetSma(20).LastOrDefault()?.Sma;
+        var sma50 = quotes.GetSma(50).LastOrDefault()?.Sma;
+        var last = quotes.Last().Close;
 
-        return (buy, sell, rsi.Rsi ?? 0);
+        double rsi = rsiList.LastOrDefault()?.Rsi ?? 50;
+        var macd = macdList.LastOrDefault();
+        double macdVal = macd?.Macd ?? 0;
+        double signal = macd?.Signal ?? 0;
+
+        int buy = 0, sell = 0;
+
+        if (rsi < 30) buy += 2;
+        else if (rsi < 45) buy += 1;
+        if (rsi > 70) sell += 2;
+        else if (rsi > 55) sell += 1;
+
+        if (macdVal > signal) buy += 1;
+        else sell += 1;
+
+        if (sma20 is not null && last > (decimal)sma20) buy += 1;
+        if (sma50 is not null && last > (decimal)sma50) buy += 1;
+        if (sma20 is not null && last < (decimal)sma20) sell += 1;
+        if (sma50 is not null && last < (decimal)sma50) sell += 1;
+
+        return new TfResult { Rsi = rsi, BuyScore = buy, SellScore = sell };
     }
 
     static (decimal Support, decimal Resistance) FindSupportResistance(List<Quote> quotes)
@@ -1564,5 +2100,33 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         public decimal StopLoss { get; set; }
         public decimal TakeProfit { get; set; }
         public DateTime SignalAt { get; set; }
+    }
+
+    class NobitexOrderResult
+    {
+        public bool Ok { get; set; }
+        public string Error { get; set; } = "";
+        public long? OrderId { get; set; }
+        public decimal? FillPrice { get; set; }
+        public string Raw { get; set; } = "";
+    }
+
+    class PendingOrder
+    {
+        public string Side { get; set; } = "LONG";
+        public string Symbol { get; set; } = "";
+        public decimal Entry { get; set; }
+        public decimal StopLoss { get; set; }
+        public decimal TakeProfit { get; set; }
+        public int Leverage { get; set; } = 1;
+        public decimal? BudgetToman { get; set; }
+        public DateTime CreatedAt { get; set; } = DateTime.UtcNow;
+    }
+
+    class TfResult
+    {
+        public double Rsi { get; set; }
+        public int BuyScore { get; set; }
+        public int SellScore { get; set; }
     }
 }
