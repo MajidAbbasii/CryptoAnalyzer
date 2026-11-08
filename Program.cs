@@ -833,6 +833,8 @@ WHERE Symbol=$s AND Status='Pending'";
         if (data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase) ||
             data.StartsWith("note_", StringComparison.OrdinalIgnoreCase))
         {
+            return "خرید/فروش خودکار فعلاً غیرفعال است.\nفقط سیگنال‌ها ارسال می‌شوند.";
+
             bool isExec = data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase);
             string id = data[(data.IndexOf('_') + 1)..];
 
@@ -901,6 +903,9 @@ WHERE Symbol=$s AND Status='Pending'";
 
         if (parts[0] == "confirm_pending")
         {
+            PendingOrders.Remove(chatId);
+            return "ثبت سفارش روی نوبیتکس فعلاً خاموش است.";
+
             if (!PendingOrders.TryGetValue(chatId, out var pend) || pend.BudgetToman is null)
                 return "سفارش معلقی نیست. دوباره از سیگنال شروع کن.";
 
@@ -1260,20 +1265,29 @@ WHERE Symbol=$s AND Status='Pending'";
             // callback_data کوتاه تا BUTTON_DATA_INVALID نشود
             string id = StorePayload(fullPayload);
 
+        //    var keyboard = new InlineKeyboardMarkup(new[]
+        //    {
+        //    new[]
+        //    {
+        //        InlineKeyboardButton.WithCallbackData(
+        //            side == "LONG" ? "⚡ تعهدی LONG" : "⚡ تعهدی SHORT",
+        //            $"exec_{id}"),
+        //        InlineKeyboardButton.WithCallbackData("📝 فقط یادداشت", $"note_{id}")
+        //    },
+        //    new[]
+        //    {
+        //        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
+        //    }
+        //});
+
             var keyboard = new InlineKeyboardMarkup(new[]
-            {
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData(
-                    side == "LONG" ? "⚡ تعهدی LONG" : "⚡ تعهدی SHORT",
-                    $"exec_{id}"),
-                InlineKeyboardButton.WithCallbackData("📝 فقط یادداشت", $"note_{id}")
-            },
-            new[]
-            {
-                InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
-            }
-        });
+{
+    new[]
+    {
+        InlineKeyboardButton.WithCallbackData("📝 دیدم", $"note_{id}"),
+        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
+    }
+});
 
             return (text, keyboard);
         }
