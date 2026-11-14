@@ -1,20 +1,71 @@
-﻿using System.Text;
+using System.Text;
 using Binance.Net.Clients;
 using Binance.Net.Enums;
 using Microsoft.Data.Sqlite;
 using Skender.Stock.Indicators;
 using Telegram.Bot;
 using Telegram.Bot.Types.ReplyMarkups;
+using CryptoAnalyzer.Analysis;
+using CryptoAnalyzer.Exchanges;
+using CryptoAnalyzer.Persistence;
 
 class Program
 {
+    // Fail-closed until the complete multi-exchange order lifecycle has passed tests.
+    private const bool TradingExecutionEnabled = false;
     const string OllamaModel = "llama3.2:latest";
     const string OllamaUrl = "http://127.0.0.1:11434";
-    const string TelegramToken = "8651996991:AAFn4VOg06S6SM5G82Cni5kygjyi_i-CdE0";
+    static readonly string TelegramToken = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN") ?? "";
+    static readonly HttpClient ExchangeHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
+    static readonly NobitexReadOnlyAdapter NobitexReadOnly = new(ExchangeHttpClient);
+    static readonly NobitexTradingAdapter NobitexTrading = new(
+        new HttpClient { Timeout = TimeSpan.FromSeconds(15) }, NobitexReadOnly);
+    static readonly HttpClient BinanceTestnetHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
+    static readonly BinanceSpotTestnetReadOnlyAdapter BinanceTestnetReadOnly = new(BinanceTestnetHttpClient);
     static readonly string NobitexBaseUrl = "https://apiv2.nobitex.ir";
+    private const string DatabaseConnectionString = "Data Source=crypto_analyzer.db;Foreign Keys=True";
     static decimal UsdtTomanRate = 276_000m;
     static readonly Dictionary<string, string> SignalPayloads = new();
     static readonly Dictionary<long, PendingOrder> PendingOrders = new();
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<long, OrderWizardState> OrderWizards = new();
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<long, ManualUiState> ManualUiStates = new();
+    static readonly System.Collections.Concurrent.ConcurrentDictionary<long, AccountLinkState> AccountLinkStates = new();
+
+    sealed class AccountLinkState
+    {
+        public string Step { get; set; } = "label";
+        public string Label { get; set; } = "";
+        public string ApiKey { get; set; } = "";
+        public long? AccountId { get; set; }
+    }
+
+    sealed class ManualUiState
+    {
+        public string Action { get; set; } = "";
+        public string Step { get; set; } = "symbol";
+        public string Symbol { get; set; } = "";
+        public decimal EntryPrice { get; set; }
+        public string? ApprovalId { get; set; }
+    }
+
+    sealed class OrderWizardState
+    {
+        public long AccountId { get; set; }
+        public string Symbol { get; set; } = "";
+        public ExchangeTradeMode Mode { get; set; }
+        public ExchangeOrderSide Side { get; set; }
+        public ExchangeOrderType Type { get; set; }
+        public decimal Quantity { get; set; }
+        public decimal? LimitPrice { get; set; }
+        public decimal? PriceGuard { get; set; }
+        public decimal? StopLoss { get; set; }
+        public decimal? TakeProfit { get; set; }
+        public decimal Leverage { get; set; } = 1m;
+        public string Step { get; set; } = "symbol";
+        public bool IsSignalTrade { get; set; }
+        public decimal? RequestedBudgetUsdt { get; set; }
+        public decimal SignalEntryPrice { get; set; }
+    }
 
     static readonly string NobitexApiKey =
         Environment.GetEnvironmentVariable("API_KEY") ?? "";
@@ -29,6 +80,15 @@ class Program
         Console.WriteLine("Press Ctrl+C to stop\n");
 
         InitializeDatabase();
+
+        if (args.Any(x => x.Equals("--account-add", StringComparison.OrdinalIgnoreCase)))
+        {
+            ProvisionExchangeAccountInteractive();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(TelegramToken))
+            throw new InvalidOperationException("TELEGRAM_BOT_TOKEN environment variable is required.");
 
         var restClient = new BinanceRestClient();
         var botClient = new TelegramBotClient(TelegramToken);
@@ -45,7 +105,7 @@ class Program
                 // 1) بررسی حد ضرر / هدف سود معاملات باز همه کاربران
                 await CheckOpenTrades(restClient, botClient);
 
-                await ResolvePendingSignals(restClient);
+                await ResolvePendingSignals();
 
                 // 2) لیست ارزهای پرمعامله
                 var symbols = await GetTopVolumeSymbols(restClient);
@@ -56,9 +116,9 @@ class Program
 
                 foreach (var symbol in symbols)
                 {
-                    var signal = await AnalyzeSymbol(restClient, symbol);
-                    if (signal != null)
-                        buySignals.Add(signal.Value);
+                    var signals = await AnalyzeSymbol(restClient, symbol);
+                    if (signals is not null)
+                        buySignals.AddRange(signals);
 
                     await Task.Delay(500);
                 }
@@ -90,7 +150,7 @@ class Program
                     {
                         try
                         {
-                            var sellText = await AnalyzeSellForOpenTrade(restClient, trade.Symbol);
+                            var sellText = await AnalyzeSellForOpenTrade(trade);
                             if (string.IsNullOrEmpty(sellText))
                                 continue;
 
@@ -98,11 +158,12 @@ class Program
                             {
                             new[]
                             {
-                                InlineKeyboardButton.WithCallbackData("✅ فروختم", $"sold|{trade.Symbol}")
+                                InlineKeyboardButton.WithCallbackData("✅ خروج را دستی انجام دادم", $"sold|{trade.Id}")
                             }
                         });
 
                             await botClient.SendMessage(chatId, sellText, replyMarkup: sellKeyboard);
+                            MarkExitSuggested(trade.Id, "StrategyExit");
                             Console.WriteLine($"SELL sent to {chatId} for {trade.Symbol}");
                         }
                         catch (Exception ex)
@@ -171,6 +232,9 @@ class Program
     static async Task<(int Status, string Body)> NobitexSendAsync(
         HttpMethod method, string fullPath, string? jsonBody)
     {
+        if (method != HttpMethod.Get && (!TradingExecutionEnabled || !OrderExecutionPolicy.IsLiveExecutionEnabled))
+            return (0, "Trading execution is disabled in the current manual-only phase.");
+
         string rawBody = jsonBody ?? "";
         string url = NobitexBaseUrl + fullPath;
 
@@ -226,6 +290,9 @@ class Program
     decimal stopLoss,
     decimal takeProfit)
     {
+        if (!OrderExecutionPolicy.IsLiveExecutionEnabled)
+            return new NobitexOrderResult { Ok = false, Error = "Live exchange order execution is disabled." };
+
         if ((string.IsNullOrWhiteSpace(NobitexApiKey) || string.IsNullOrWhiteSpace(NobitexApiSecret)))
         {
             return new NobitexOrderResult
@@ -403,18 +470,19 @@ class Program
         }
     }
 
-    static bool HasPendingSignal(string symbol)
+    static bool HasPendingSignal(string symbol, string tradeMode = "MARGIN")
     {
         // اگر SignalTracks داری از DB بخوان؛ وگرنه false
         try
         {
-            using var conn = new Microsoft.Data.Sqlite.SqliteConnection("Data Source=crypto_analyzer.db");
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
             conn.Open();
             var cmd = conn.CreateCommand();
             cmd.CommandText = @"
 SELECT COUNT(1) FROM SignalTracks
-WHERE Symbol=$s AND Status='Pending'";
+WHERE Symbol=$s AND TradeMode=$m AND Status='Pending'";
             cmd.Parameters.AddWithValue("$s", symbol);
+            cmd.Parameters.AddWithValue("$m", tradeMode);
             var n = Convert.ToInt32(cmd.ExecuteScalar());
             return n > 0;
         }
@@ -428,7 +496,8 @@ WHERE Symbol=$s AND Status='Pending'";
     {
         if (SignalPayloads.TryGetValue(id, out full!))
         {
-            SignalPayloads.Remove(id);
+            // A single signal is broadcast to many users; consuming it on the
+            // first callback would make every other user's button expire.
             return true;
         }
         full = "";
@@ -515,209 +584,38 @@ WHERE Symbol=$s AND Status='Pending'";
         return set;
     }
 
-    static void TrackSignal(string symbol, decimal entry, decimal sl, decimal tp)
+    static void TrackSignal(string symbol, decimal entry, decimal sl, decimal tp,
+        string side = "LONG", string tradeMode = "MARGIN", string exchangeCode = "NOBITEX")
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-        INSERT INTO SignalTracks (Symbol, EntryPrice, StopLoss, TakeProfit, Status)
-        VALUES ($s, $e, $sl, $tp, 'Pending')";
-        cmd.Parameters.AddWithValue("$s", symbol);
-        cmd.Parameters.AddWithValue("$e", entry);
-        cmd.Parameters.AddWithValue("$sl", sl);
-        cmd.Parameters.AddWithValue("$tp", tp);
-        cmd.ExecuteNonQuery();
-    }
-
-    // ==================== خواندن Pending ====================
-
-    static List<SignalTrack> GetPendingSignals()
-    {
-        var list = new List<SignalTrack>();
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-        SELECT Id, Symbol, EntryPrice, StopLoss, TakeProfit, SignalAt
-        FROM SignalTracks
-        WHERE Status = 'Pending'";
-
-        using var r = cmd.ExecuteReader();
-        while (r.Read())
+        try
         {
-            DateTime signalAt;
-            var raw = r.GetString(5);
-            if (!DateTime.TryParse(raw, null,
-                    System.Globalization.DateTimeStyles.RoundtripKind, out signalAt))
-                signalAt = DateTime.UtcNow;
+            side = string.IsNullOrWhiteSpace(side) ? "LONG" : side.ToUpperInvariant();
 
-            list.Add(new SignalTrack
-            {
-                Id = r.GetInt32(0),
-                Symbol = r.GetString(1),
-                EntryPrice = r.GetDecimal(2),
-                StopLoss = r.GetDecimal(3),
-                TakeProfit = r.GetDecimal(4),
-                SignalAt = signalAt
-            });
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO SignalTracks
+    (Symbol, Side, TradeMode, ExchangeCode, EntryPrice, StopLoss, TakeProfit, Status, SignalAt)
+VALUES
+    ($s, $side, $mode, $exchange, $e, $sl, $tp, 'Pending', $t);";
+            cmd.Parameters.AddWithValue("$s", symbol);
+            cmd.Parameters.AddWithValue("$side", side);
+            cmd.Parameters.AddWithValue("$mode", tradeMode);
+            cmd.Parameters.AddWithValue("$exchange", exchangeCode);
+            cmd.Parameters.AddWithValue("$e", entry);
+            cmd.Parameters.AddWithValue("$sl", sl);
+            cmd.Parameters.AddWithValue("$tp", tp);
+            cmd.Parameters.AddWithValue("$t", DateTime.UtcNow.ToString("o"));
+            cmd.ExecuteNonQuery();
         }
-        return list;
+        catch (Exception ex)
+        {
+            Console.WriteLine($"TrackSignal: {ex.Message}");
+        }
     }
 
     // ==================== به‌روزرسانی وضعیت ====================
-
-    static void UpdateSignal(int id, string status, decimal resolvePrice)
-    {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-        UPDATE SignalTracks
-        SET Status = $st,
-            ResolvedAt = CURRENT_TIMESTAMP,
-            ResolvePrice = $p
-        WHERE Id = $id";
-        cmd.Parameters.AddWithValue("$st", status);
-        cmd.Parameters.AddWithValue("$p", resolvePrice);
-        cmd.Parameters.AddWithValue("$id", id);
-        cmd.ExecuteNonQuery();
-    }
-
-    // ==================== چک کردن رسیدن به TP / SL ====================
-
-    static async Task ResolvePendingSignals(BinanceRestClient client)
-    {
-        var pending = GetPendingSignals();
-
-        foreach (var s in pending)
-        {
-            try
-            {
-                var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(s.Symbol);
-                await Task.Delay(150);
-                if (!ticker.Success) continue;
-
-                decimal price = ticker.Data.LastPrice;
-
-                if (price >= s.TakeProfit)
-                {
-                    UpdateSignal(s.Id, "HitTP", price);
-                    Console.WriteLine($"Signal HitTP: {s.Symbol} @ {price:N4}");
-                }
-                else if (price <= s.StopLoss)
-                {
-                    UpdateSignal(s.Id, "HitSL", price);
-                    Console.WriteLine($"Signal HitSL: {s.Symbol} @ {price:N4}");
-                }
-                else if (DateTime.UtcNow - s.SignalAt.ToUniversalTime() > TimeSpan.FromHours(24))
-                {
-                    UpdateSignal(s.Id, "Expired", price);
-                    Console.WriteLine($"Signal Expired: {s.Symbol} @ {price:N4}");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Resolve signal {s.Symbol}: {ex.Message}");
-            }
-        }
-    }
-
-    // ==================== گزارش /report ====================
-
-    static string GetSignalReport()
-    {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-
-        int hitTp = 0, hitSl = 0, pending = 0, expired = 0, total = 0;
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT Status, COUNT(1) FROM SignalTracks GROUP BY Status";
-
-        using (var r = cmd.ExecuteReader())
-        {
-            while (r.Read())
-            {
-                string st = r.GetString(0);
-                int c = r.GetInt32(1);
-                total += c;
-                if (st == "HitTP") hitTp = c;
-                else if (st == "HitSL") hitSl = c;
-                else if (st == "Pending") pending = c;
-                else if (st == "Expired") expired = c;
-            }
-        }
-
-        int resolved = hitTp + hitSl;
-        double winRate = resolved > 0 ? (double)hitTp / resolved * 100.0 : 0;
-
-        // میانگین سود/ضرر فرضی روی موارد بسته شده
-        cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-        SELECT Status, EntryPrice, ResolvePrice
-        FROM SignalTracks
-        WHERE Status IN ('HitTP', 'HitSL')";
-
-        double sumPnl = 0;
-        int pnlCount = 0;
-        using (var r = cmd.ExecuteReader())
-        {
-            while (r.Read())
-            {
-                string st = r.GetString(0);
-                decimal entry = r.GetDecimal(1);
-                decimal resolve = r.GetDecimal(2);
-                if (entry <= 0) continue;
-
-                double pnl = (double)((resolve - entry) / entry * 100m);
-                sumPnl += pnl;
-                pnlCount++;
-            }
-        }
-
-        double avgPnl = pnlCount > 0 ? sumPnl / pnlCount : 0;
-
-        var lines = new List<string>
-    {
-        "📊 گزارش سیگنال‌های BUY",
-        $"کل سیگنال‌ها: {total}",
-        $"✅ رسید به TP: {hitTp}",
-        $"🛑 خورد به SL: {hitSl}",
-        $"⏳ در انتظار: {pending}",
-        $"⌛ منقضی (۲۴س): {expired}",
-        resolved > 0
-            ? $"نرخ موفقیت (TP / تعیین‌تکلیف‌شده): {winRate:N1}%"
-            : "هنوز مورد تعیین‌تکلیف‌شده کافی نیست",
-        pnlCount > 0
-            ? $"میانگین PnL فرضی: {avgPnl:N2}%"
-            : "میانگین PnL: -",
-        "",
-        "آخرین ۱۵ سیگنال:"
-    };
-
-        cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-        SELECT Symbol, EntryPrice, TakeProfit, StopLoss, Status, SignalAt
-        FROM SignalTracks
-        ORDER BY Id DESC
-        LIMIT 15";
-
-        using (var r = cmd.ExecuteReader())
-        {
-            while (r.Read())
-            {
-                lines.Add(
-                    $"{r.GetString(0)} | E:{r.GetDecimal(1):N4} | TP:{r.GetDecimal(2):N4} | " +
-                    $"SL:{r.GetDecimal(3):N4} | {r.GetString(4)} | {r.GetString(5)}");
-            }
-        }
-
-        if (total == 0)
-            return "📊 هنوز سیگنالی ثبت نشده است.";
-
-        return string.Join("\n", lines);
-    }
 
     static async Task ListenTelegramCommands(TelegramBotClient bot, BinanceRestClient restClient)
     {
@@ -734,9 +632,20 @@ WHERE Symbol=$s AND Status='Pending'";
                     if (update.CallbackQuery is { } cb)
                     {
                         long chatId = cb.Message?.Chat.Id ?? cb.From.Id;
-                        var answer = await HandleCallback(chatId, cb.Data ?? "", restClient);
+                        var callbackData = cb.Data ?? "";
+                        if (callbackData == "ui|addaccount" &&
+                            !string.Equals(cb.Message?.Chat.Type.ToString(), "Private", StringComparison.OrdinalIgnoreCase))
+                        {
+                            await bot.AnswerCallbackQuery(cb.Id, "برای امنیت، اتصال حساب فقط در گفت‌وگوی خصوصی ربات امکان‌پذیر است.");
+                            continue;
+                        }
+                        var uiResult = await HandleUiCallback(chatId, callbackData);
+                        var answer = uiResult?.Text ?? await HandleCallback(chatId, callbackData, restClient);
                         await bot.AnswerCallbackQuery(cb.Id, answer.Length > 180 ? answer[..180] : answer);
-                        await bot.SendMessage(chatId, answer);
+                        if (uiResult is not null)
+                            await bot.SendMessage(chatId, answer, replyMarkup: uiResult.Value.Keyboard);
+                        else
+                            await bot.SendMessage(chatId, answer, replyMarkup: MainMenuKeyboard());
                         continue;
                     }
 
@@ -746,19 +655,239 @@ WHERE Symbol=$s AND Status='Pending'";
                     long userChatId = msg.Chat.Id;
                     string text = msg.Text.Trim();
 
+                    if (AccountLinkStates.TryGetValue(userChatId, out var accountLink) && !text.StartsWith('/'))
+                    {
+                        if (accountLink.Step == "label")
+                        {
+                            if (string.IsNullOrWhiteSpace(text) || text.Length > 80)
+                            {
+                                await bot.SendMessage(userChatId, "نام حساب باید بین ۱ تا ۸۰ نویسه باشد. دوباره وارد کن یا /cancel بزن.");
+                                continue;
+                            }
+                            accountLink.Label = text;
+                            accountLink.Step = "apikey";
+                            await bot.SendMessage(userChatId,
+                                "اکنون API Key عمومی نوبیتکس را ارسال کن. از پنل نوبیتکس یک API Key با دسترسی READ بساز (برای ثبت سفارش در نسخه آینده، TRADE هم لازم می‌شود). دسترسی WITHDRAW را فعال نکن. پیام کلید پس از دریافت حذف می‌شود.",
+                                replyMarkup: CancelWizardKeyboard());
+                            continue;
+                        }
+
+                        if (accountLink.Step == "apikey")
+                        {
+                            try { await bot.DeleteMessage(userChatId, msg.MessageId); }
+                            catch (Exception ex) { Console.WriteLine($"Could not delete credential message for user {userChatId}: {ex.GetType().Name}"); }
+
+                            if (text.Length is < 12 or > 512 || text.Any(char.IsWhiteSpace))
+                            {
+                                await bot.SendMessage(userChatId, "فرمت API Key معتبر به نظر نمی‌رسد. مقدار را بدون فاصله دوباره ارسال کن یا /cancel بزن.");
+                                continue;
+                            }
+                            accountLink.ApiKey = text;
+                            accountLink.Step = "secret";
+                            text = string.Empty;
+                            await bot.SendMessage(userChatId,
+                                "حالا کلید خصوصی (API Secret / Private Key) متناظر با همین API Key را ارسال کن. این کلید فقط برای امضای درخواست‌ها استفاده می‌شود و به‌صورت رمزنگاری‌شده ذخیره خواهد شد. پیام پس از دریافت حذف می‌شود.",
+                                replyMarkup: CancelWizardKeyboard());
+                            continue;
+                        }
+
+                        if (accountLink.Step == "secret")
+                        {
+                            try { await bot.DeleteMessage(userChatId, msg.MessageId); }
+                            catch (Exception ex) { Console.WriteLine($"Could not delete private-key message for user {userChatId}: {ex.GetType().Name}"); }
+
+                            if (text.Length is < 32 or > 512 || text.Any(char.IsWhiteSpace))
+                            {
+                                await bot.SendMessage(userChatId, "فرمت کلید خصوصی معتبر نیست. مقدار کامل Base64/Base64URL را بدون فاصله دوباره ارسال کن یا /cancel بزن.");
+                                continue;
+                            }
+
+                            try
+                            {
+                                var credentials = new ExchangeCredentials(accountLink.ApiKey, text);
+                                var validation = await NobitexReadOnly.ValidateCredentialsDetailedAsync(credentials);
+                                if (!validation.IsValid)
+                                {
+                                    Console.WriteLine($"Nobitex API-key validation failed for chat {userChatId}: {validation.Message}");
+                                    string reason = validation.Message.Length > 700
+                                        ? validation.Message[..700]
+                                        : validation.Message;
+                                    await bot.SendMessage(userChatId,
+                                        "❌ اعتبارسنجی نوبیتکس ناموفق بود؛ کلیدها ذخیره نشدند.\n\n" +
+                                        $"جزئیات پاسخ: {reason}\n\n" +
+                                        "اگر پاسخ HTTP 401/403 است، مجوز READ و محدودیت IP کلید را بررسی کن. اگر خطای شبکه/429 است، مسیر دسترسی سرور به نوبیتکس را بررسی کن. کلید خصوصی را دوباره در چت نفرست مگر پس از رفع علت.");
+                                    continue;
+                                }
+
+                                var accountRepository = new UserExchangeAccountRepository(DatabaseConnectionString);
+                                long accountId;
+                                if (accountLink.AccountId is long existingAccountId)
+                                {
+                                    if (!accountRepository.UpdateCredentials(userChatId, existingAccountId, accountLink.ApiKey, text))
+                                        throw new KeyNotFoundException("Active Nobitex account was not found for credential update.");
+                                    accountId = existingAccountId;
+                                }
+                                else
+                                {
+                                    accountId = accountRepository.Add(userChatId, "NOBITEX", accountLink.Label, accountLink.ApiKey, text);
+                                }
+                                accountLink.ApiKey = string.Empty;
+                                AccountLinkStates.TryRemove(userChatId, out _);
+                                await bot.SendMessage(userChatId,
+                                    $"✅ کلیدهای API حساب «{accountLink.Label}» با امضای Ed25519 تأیید و ذخیره شدند (شناسه #{accountId}). کلید عمومی و خصوصی به‌صورت رمزنگاری‌شده ذخیره شدند. فعلاً اجرای سفارش واقعی غیرفعال است.",
+                                    replyMarkup: AccountMenuKeyboard());
+                            }
+                            catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UnauthorizedAccessException or System.Text.Json.JsonException)
+                            {
+                                await bot.SendMessage(userChatId, "ارتباط با نوبیتکس یا اعتبارسنجی امضای API Key ناموفق بود؛ بعداً دوباره تلاش کن. کلیدها ذخیره نشدند.");
+                            }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Account linking failed for user {userChatId}: {ex.GetType().Name}");
+                                await bot.SendMessage(userChatId, "ثبت حساب انجام نشد. کلیدها ذخیره نشدند؛ تنظیمات رمزنگاری و پایگاه داده میزبان را بررسی کن.");
+                            }
+                            finally
+                            {
+                                // Do not retain the submitted private key in the per-user conversation state.
+                                text = string.Empty;
+                            }
+                            continue;
+                        }
+                    }
+
+                    if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase))
+                    {
+                        AccountLinkStates.TryRemove(userChatId, out _);
+                        OrderWizards.TryRemove(userChatId, out _);
+                        ManualUiStates.TryRemove(userChatId, out _);
+                        await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: MainMenuKeyboard());
+                        continue;
+                    }
+
                     // عضویت
                     if (text.StartsWith("/start"))
                     {
                         RegisterUser(userChatId, msg.From?.Username, msg.From?.FirstName);
                         await bot.SendMessage(userChatId,
-                            "خوش آمدید ✅\nسیگنال‌ها برایتان ارسال می‌شود.\n\nدستورها:\n/start - فعال‌سازی\n/stop - توقف سیگنال\n/open - معاملات باز من\n/stats - آمار من");
+                            "خوش آمدید ✅\nاز منوی زیر برای مدیریت ربات و حساب‌ها استفاده کنید.",
+                            replyMarkup: MainMenuKeyboard());
+                        continue;
+                    }
+
+                    if (OrderWizards.TryGetValue(userChatId, out var wizard) && !text.StartsWith('/'))
+                    {
+                        var (wizardText, wizardKeyboard) = await HandleOrderWizardInput(userChatId, text);
+                        await bot.SendMessage(userChatId, wizardText, replyMarkup: wizardKeyboard);
+                        continue;
+                    }
+
+                    if (ManualUiStates.ContainsKey(userChatId) && !text.StartsWith('/'))
+                    {
+                        var (uiText, uiKeyboard) = await HandleManualUiInput(userChatId, text);
+                        await bot.SendMessage(userChatId, uiText, replyMarkup: uiKeyboard);
+                        continue;
+                    }
+
+                    if (text.Equals("/accounts", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var accounts = new UserExchangeAccountRepository(DatabaseConnectionString).List(userChatId);
+                        string accountText = accounts.Count == 0
+                            ? "حسابی متصل نیست. از منوی «حساب‌ها و صرافی‌ها» گزینه «اتصال حساب نوبیتکس» را انتخاب کن."
+                            : "حساب‌های صرافی شما:\n" + string.Join("\n", accounts.Select(a =>
+                                $"#{a.Id} | {a.ExchangeCode} | {a.AccountLabel} | {(a.IsActive ? "فعال" : "غیرفعال")}"));
+                        await bot.SendMessage(userChatId, accountText);
+                        continue;
+                    }
+
+                    if (text.StartsWith("/account-check", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string[] commandParts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (commandParts.Length != 2 || !long.TryParse(commandParts[1], out long accountId) || accountId <= 0)
+                        {
+                            await bot.SendMessage(userChatId, "برای بررسی اتصال، از منوی «حساب‌ها و صرافی‌ها» حساب موردنظر را انتخاب کنید.", replyMarkup: AccountMenuKeyboard());
+                            continue;
+                        }
+
+                        var account = new UserExchangeAccountRepository(DatabaseConnectionString).List(userChatId)
+                            .FirstOrDefault(x => x.Id == accountId && x.IsActive);
+                        if (account is null)
+                        {
+                            await bot.SendMessage(userChatId, "حساب فعال متعلق به شما پیدا نشد.");
+                            continue;
+                        }
+                        IExchangeAdapter? adapter = account.ExchangeCode.ToUpperInvariant() switch
+                        {
+                            "NOBITEX" => NobitexReadOnly,
+                            "BINANCE_TESTNET" => BinanceTestnetReadOnly,
+                            _ => null
+                        };
+                        if (adapter is null)
+                        {
+                            await bot.SendMessage(userChatId, "آداپتر read-only این صرافی هنوز پیاده‌سازی نشده است.");
+                            continue;
+                        }
+                        var credentials = new UserExchangeAccountRepository(DatabaseConnectionString).GetCredentials(userChatId, accountId);
+                        bool valid = await adapter.ValidateCredentialsAsync(credentials);
+                        await bot.SendMessage(userChatId, valid
+                            ? $"✅ اتصال حساب {account.AccountLabel} به {adapter.ExchangeCode} معتبر است. فقط دسترسی خواندن بررسی شد؛ معامله فعال نیست."
+                            : $"❌ اعتبارسنجی {adapter.ExchangeCode} ناموفق بود؛ کلیدها، مجوز USER_DATA و دسترسی شبکه را بررسی کن.");
+                        continue;
+                    }
+
+                    if (text.StartsWith("/balances", StringComparison.OrdinalIgnoreCase))
+                    {
+                        string[] commandParts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+                        if (commandParts.Length != 2 || !long.TryParse(commandParts[1], out long accountId) || accountId <= 0)
+                        {
+                            await bot.SendMessage(userChatId, "برای مشاهده موجودی، از منوی «حساب‌ها و صرافی‌ها» حساب موردنظر را انتخاب کنید.", replyMarkup: AccountMenuKeyboard());
+                            continue;
+                        }
+
+                        var account = new UserExchangeAccountRepository(DatabaseConnectionString).List(userChatId)
+                            .FirstOrDefault(x => x.Id == accountId && x.IsActive);
+                        if (account is null)
+                        {
+                            await bot.SendMessage(userChatId, "حساب فعال متعلق به شما پیدا نشد.");
+                            continue;
+                        }
+                        IExchangeAdapter? adapter = account.ExchangeCode.ToUpperInvariant() switch
+                        {
+                            "NOBITEX" => NobitexReadOnly,
+                            "BINANCE_TESTNET" => BinanceTestnetReadOnly,
+                            _ => null
+                        };
+                        if (adapter is null)
+                        {
+                            await bot.SendMessage(userChatId, "خواندن موجودی این صرافی هنوز پیاده‌سازی نشده است.");
+                            continue;
+                        }
+                        var credentials = new UserExchangeAccountRepository(DatabaseConnectionString).GetCredentials(userChatId, accountId);
+                        ExchangeAccountSnapshot snapshot;
+                        try { snapshot = await adapter.GetAccountSnapshotAsync(credentials); }
+                        catch (Exception ex) when (ex is HttpRequestException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException)
+                        {
+                            await bot.SendMessage(userChatId, $"دریافت موجودی {adapter.ExchangeCode} ناموفق بود؛ اعتبار کلید و دسترسی شبکه را بررسی کن.");
+                            continue;
+                        }
+                        string balanceText = string.Join("\n", snapshot.Balances.Where(x => x.Total != 0 || x.Locked != 0)
+                            .OrderByDescending(x => x.Total).Take(30)
+                            .Select(x => $"{x.Asset}: کل {x.Total:G29} | آزاد {x.Available:G29} | مسدود {x.Locked:G29}"));
+                        if (string.IsNullOrWhiteSpace(balanceText)) balanceText = "موجودی غیرصفر دریافت نشد.";
+                        await bot.SendMessage(userChatId, $"موجودی {account.AccountLabel} (فقط خواندنی):\n{balanceText}");
+                        continue;
+                    }
+
+                    if (text.StartsWith("/preview", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var (previewText, previewKeyboard) = CreateManualOrderPreview(userChatId, text);
+                        await bot.SendMessage(userChatId, previewText, replyMarkup: previewKeyboard);
                         continue;
                     }
 
                     if (text.StartsWith("/stop"))
                     {
                         SetUserActive(userChatId, false);
-                        await bot.SendMessage(userChatId, "سیگنال‌ها برای شما متوقف شد. برای برگشت /start بزنید.");
+                        await bot.SendMessage(userChatId, "سیگنال‌ها برای شما متوقف شد. برای فعال‌سازی دوباره از دکمه «فعال‌سازی سیگنال» در منو استفاده کنید.", replyMarkup: MainMenuKeyboard());
                         continue;
                     }
 
@@ -768,7 +897,9 @@ WHERE Symbol=$s AND Status='Pending'";
                         if (text.Equals("/cancel", StringComparison.OrdinalIgnoreCase))
                         {
                             PendingOrders.Remove(userChatId);
-                            await bot.SendMessage(userChatId, "لغو شد.");
+                            OrderWizards.TryRemove(userChatId, out _);
+                            ManualUiStates.TryRemove(userChatId, out _);
+                            await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: TradesMenuKeyboard());
                             continue;
                         }
 
@@ -780,7 +911,8 @@ WHERE Symbol=$s AND Status='Pending'";
                                 out var toman) || toman < 50_000m)
                         {
                             await bot.SendMessage(userChatId,
-                                "عدد معتبر نیست.\nمثال: 300000\nحداقل ۵۰٬۰۰۰ تومان\nلغو: /cancel");
+                                "عدد معتبر نیست.\nمثال: 300000\nحداقل ۵۰٬۰۰۰ تومان\nبرای لغو از دکمه لغو استفاده کنید.",
+                                replyMarkup: CancelWizardKeyboard());
                             continue;
                         }
 
@@ -791,7 +923,7 @@ WHERE Symbol=$s AND Status='Pending'";
                         {
         new[]
         {
-            InlineKeyboardButton.WithCallbackData("✅ تأیید نهایی", "confirm_pending"),
+            InlineKeyboardButton.WithCallbackData("✅ تأیید ثبت دستی (بدون ارسال)", "confirm_pending"),
             InlineKeyboardButton.WithCallbackData("❌ انصراف", "cancel_pending")
         }
     });
@@ -813,7 +945,7 @@ WHERE Symbol=$s AND Status='Pending'";
 
                     var reply = await HandleUserCommand(userChatId, text, restClient);
                     if (!string.IsNullOrEmpty(reply))
-                        await bot.SendMessage(userChatId, reply);
+                        await bot.SendMessage(userChatId, reply, replyMarkup: MainMenuKeyboard());
                 }
             }
             catch (Exception ex)
@@ -824,18 +956,625 @@ WHERE Symbol=$s AND Status='Pending'";
         }
     }
 
+    static InlineKeyboardMarkup MainMenuKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("💼 حساب‌ها و صرافی‌ها", "ui|accountsmenu"), InlineKeyboardButton.WithCallbackData("📈 معاملات", "ui|tradesmenu") },
+        new[] { InlineKeyboardButton.WithCallbackData("📊 تحلیل و گزارش", "ui|analysismenu"), InlineKeyboardButton.WithCallbackData("⚙️ تنظیمات", "ui|settingsmenu") },
+        new[] { InlineKeyboardButton.WithCallbackData("🆘 راهنما", "ui|help") }
+    });
+
+    static InlineKeyboardMarkup BackHomeKeyboard(string backCallback) => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("↩️ بازگشت", backCallback), InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+    });
+
+    static InlineKeyboardMarkup AccountMenuKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("🧾 حساب‌های من", "ui|accounts"), InlineKeyboardButton.WithCallbackData("💰 مشاهده موجودی", "ui|balances") },
+        new[] { InlineKeyboardButton.WithCallbackData("➕ اتصال حساب نوبیتکس", "ui|addaccount") },
+        new[] { InlineKeyboardButton.WithCallbackData("🔌 بررسی اتصال", "ui|checkaccounts") },
+        new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+    });
+
+    static InlineKeyboardMarkup TradesMenuKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("📝 خرید/فروش + حد ضرر و سود", "ui|neworder"), InlineKeyboardButton.WithCallbackData("📂 معاملات باز", "ui|open") },
+        new[] { InlineKeyboardButton.WithCallbackData("➕ ثبت خرید در دفتر", "ui|bought"), InlineKeyboardButton.WithCallbackData("❌ لغو فرآیند/سفارش معلق", "ui|cancel") },
+        new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+    });
+
+    static InlineKeyboardMarkup AnalysisMenuKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("📑 گزارش سیگنال‌ها", "ui|report"), InlineKeyboardButton.WithCallbackData("📊 آمار معاملات", "ui|stats") },
+        new[] { InlineKeyboardButton.WithCallbackData("📂 معاملات باز", "ui|open") },
+        new[] { InlineKeyboardButton.WithCallbackData("⏸ توقف سیگنال", "ui|stop"), InlineKeyboardButton.WithCallbackData("▶️ فعال‌سازی سیگنال", "ui|start") },
+        new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+    });
+
+    static InlineKeyboardMarkup SettingsMenuKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("💱 مشاهده نرخ تتر", "ui|rate"), InlineKeyboardButton.WithCallbackData("✏️ تنظیم نرخ تتر", "ui|rateedit") },
+        new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+    });
+
+    static async Task<(string Text, InlineKeyboardMarkup? Keyboard)?> HandleUiCallback(long chatId, string data)
+    {
+        var p = data.Split('|');
+        if (p.Length == 2 && p[0] == "approve_order")
+        {
+            var repository = new ManualOrderApprovalRepository(DatabaseConnectionString);
+            var result = repository.ApproveForManualExecution(chatId, p[1]);
+            if (result != ApprovalTransitionResult.Updated)
+                return (result switch
+                {
+                    ApprovalTransitionResult.Expired => "مهلت تأیید تمام شده؛ پیش‌نمایش جدید بساز.",
+                    ApprovalTransitionResult.AccountInactive => "حساب صرافی غیرفعال شده است.",
+                    ApprovalTransitionResult.NotFound => "درخواست پیدا نشد یا متعلق به شما نیست.",
+                    _ => "این درخواست قبلاً تعیین‌تکلیف شده است."
+                }, MainMenuKeyboard());
+
+            bool canRegister = repository.CanRegisterAsOpenPosition(chatId, p[1]);
+            var keyboard = canRegister
+                ? new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("📝 ثبت پوزیشن پس از اجرای دستی", $"ui|registerapproved|{p[1]}") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+                })
+                : MainMenuKeyboard();
+            return ("✅ پیش‌نویس تأیید شد؛ هیچ سفارشی به صرافی ارسال نشد. پس از اینکه سفارش را شخصاً در نوبیتکس اجرا کردی، دکمه ثبت پوزیشن را بزن تا حد ضرر و سود برای پایش به دفتر معاملات اضافه شود.", keyboard);
+        }
+        if (p.Length == 2 && p[0] == "reject_order")
+        {
+            var result = new ManualOrderApprovalRepository(DatabaseConnectionString).Reject(chatId, p[1]);
+            return (result == ApprovalTransitionResult.Updated
+                ? "درخواست رد شد. هیچ سفارشی ارسال نشد."
+                : "درخواست پیدا نشد یا قبلاً تعیین‌تکلیف شده است.", MainMenuKeyboard());
+        }
+        if (p.Length < 2 || p[0] != "ui") return null;
+        var accounts = new UserExchangeAccountRepository(DatabaseConnectionString).List(chatId);
+        switch (p[1])
+        {
+            case "sigtrade" when p.Length == 4 && (p[3] is "buy" or "sell"):
+            {
+                if (!SignalPayloads.ContainsKey(p[2]))
+                    return ("این پیشنهاد منقضی شده است؛ برای دریافت پیشنهاد تازه منتظر تحلیل بعدی بمان.", MainMenuKeyboard());
+                var signalAccounts = accounts.Where(a => a.IsActive &&
+                    a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (signalAccounts.Count == 0)
+                    return ("برای معامله از روی پیشنهاد، ابتدا حساب نوبیتکس را متصل کن. اتصال فعلی فقط خواندنی است و سفارش تا زمان فعال‌سازی صریح اجرا ارسال نمی‌کند.", AccountMenuKeyboard());
+                return ($"حساب نوبیتکس برای {(p[3] == "buy" ? "خرید" : "فروش")} را انتخاب کن:",
+                    new InlineKeyboardMarkup(signalAccounts.Select(a => new[] { InlineKeyboardButton.WithCallbackData(
+                        $"#{a.Id} {a.AccountLabel}", $"ui|sigaccount|{p[2]}|{p[3]}|{a.Id}") })
+                        .Append(new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") })));
+            }
+            case "sigaccount" when p.Length == 5 && (p[3] is "buy" or "sell") &&
+                long.TryParse(p[4], out var signalAccountId):
+            {
+                if (!SignalPayloads.TryGetValue(p[2], out var signalPayload))
+                    return ("این پیشنهاد منقضی شده است؛ از پیشنهاد جدید استفاده کن.", MainMenuKeyboard());
+                var selectedSignalAccount = accounts.FirstOrDefault(a => a.Id == signalAccountId && a.IsActive &&
+                    a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase));
+                if (selectedSignalAccount is null)
+                    return ("حساب فعال نوبیتکس متعلق به شما پیدا نشد.", AccountMenuKeyboard());
+                var signalParts = signalPayload.Split('|');
+                if (signalParts.Length < 7 || !decimal.TryParse(signalParts[2], System.Globalization.NumberStyles.Number,
+                        System.Globalization.CultureInfo.InvariantCulture, out var signalEntry) ||
+                    !decimal.TryParse(signalParts[3], System.Globalization.NumberStyles.Number,
+                        System.Globalization.CultureInfo.InvariantCulture, out var signalSl) ||
+                    !decimal.TryParse(signalParts[4], System.Globalization.NumberStyles.Number,
+                        System.Globalization.CultureInfo.InvariantCulture, out var signalTp))
+                    return ("اطلاعات قیمت پیشنهاد معتبر نیست؛ از پیشنهاد جدید استفاده کن.", MainMenuKeyboard());
+
+                bool isBuy = p[3] == "buy";
+                OrderWizards[chatId] = new OrderWizardState
+                {
+                    AccountId = signalAccountId,
+                    Symbol = signalParts[1].ToUpperInvariant(),
+                    Mode = ExchangeTradeMode.Spot,
+                    Side = isBuy ? ExchangeOrderSide.Buy : ExchangeOrderSide.Sell,
+                    Type = ExchangeOrderType.Market,
+                    IsSignalTrade = true,
+                    SignalEntryPrice = signalEntry,
+                    StopLoss = isBuy ? signalSl : null,
+                    TakeProfit = isBuy ? signalTp : null,
+                    Step = isBuy ? "budget" : "quantity"
+                };
+                ManualUiStates.TryRemove(chatId, out _);
+                return (isBuy
+                    ? $"خرید Spot {signalParts[1]} با بودجه USDT\nموجودی تتر از حساب نوبیتکس خوانده می‌شود و مقدار تقریبی با قیمت لحظه‌ای محاسبه خواهد شد. بودجه به USDT را وارد کن (حداقل ۱۱ USDT):"
+                    : $"فروش Spot {signalParts[1]}\nموجودی آزاد کوین از حساب نوبیتکس بررسی می‌شود. مقدار {signalParts[1]} برای فروش را وارد کن:", CancelWizardKeyboard());
+            }
+            case "home":
+                OrderWizards.TryRemove(chatId, out _);
+                ManualUiStates.TryRemove(chatId, out _);
+                AccountLinkStates.TryRemove(chatId, out _);
+                return ("منوی اصلی:", MainMenuKeyboard());
+            case "accountsmenu": return ("مدیریت حساب‌ها (تمام عملیات صرافی در این بخش فقط خواندنی است):", AccountMenuKeyboard());
+            case "tradesmenu": return ("مدیریت معاملات:", TradesMenuKeyboard());
+            case "analysismenu": return ("تحلیل، گزارش و وضعیت سیگنال‌ها:", AnalysisMenuKeyboard());
+            case "settingsmenu": return ($"تنظیمات ربات | نرخ فعلی تتر: {UsdtTomanRate:N0} تومان", SettingsMenuKeyboard());
+            case "help":
+                return ("راهنمای ربات\n\n• حساب‌ها، اتصال و موجودی: فقط خواندنی\n• خرید/فروش: با دکمه‌ها حساب، Spot/Margin، سمت، نوع سفارش، مقدار و قیمت را انتخاب کنید.\n• خرید Spot: پس از اجرای دستی خرید و ثبت قیمت واقعی، پوزیشن و مقدار آن در دفتر ذخیره می‌شود؛ از فهرست معاملات باز می‌توان درخواست OCO خروج (حد سود + حد ضرر) را جداگانه ثبت کرد.\n• OCO Spot موجودی آزاد و قیمت لحظه‌ای را بررسی می‌کند؛ اگر قیمت از محدوده حدها عبور کرده باشد، درخواست رد می‌شود.\n• Margin: ورود Limit و هر دو حد ضرر/سود الزامی است؛ OCO بستن پوزیشن تعهدی از قبل در آداپتر موجود است.\n• تأیید سفارش ورود هنوز فقط پیش‌نویس را برای اجرای دستی تأیید می‌کند و سفارش ورود نمی‌فرستد.\n• اجرای واقعی از قفل ایمنی سراسری پیروی می‌کند و در این نسخه غیرفعال است؛ تست‌های فعلی با Mock هستند.\n• برای ورود نماد، مقدار، قیمت و حدها، فقط متن عددی/نماد را در مرحله مربوطه ارسال کنید.", BackHomeKeyboard("ui|home"));
+            case "cancel":
+                OrderWizards.TryRemove(chatId, out _);
+                ManualUiStates.TryRemove(chatId, out _);
+                AccountLinkStates.TryRemove(chatId, out _);
+                bool hadPending = PendingOrders.Remove(chatId);
+                return (hadPending ? "فرآیند و سفارش معلق لغو شد." : "فرآیند ورودی لغو شد. پیش‌نویس‌های سفارش را از دکمه «رد سفارش» همان پیام تعیین‌تکلیف کنید." , TradesMenuKeyboard());
+            case "registerapproved" when p.Length == 3:
+                OrderWizards.TryRemove(chatId, out _);
+                ManualUiStates[chatId] = new ManualUiState { Action = "registerapproved", Step = "entryprice", ApprovalId = p[2] };
+                return ("سفارش را واقعاً در صرافی اجرا کرده‌ای؟ فقط در صورت تکمیل خرید/فروش، قیمت میانگین اجرای واقعی را وارد کن تا پوزیشن با حد ضرر و سود در دفتر ثبت شود:", CancelWizardKeyboard());
+            case "spotoco" when p.Length == 3 && int.TryParse(p[2], out var spotOcoTradeId):
+            {
+                var trade = GetOpenTrades(chatId).FirstOrDefault(x => x.Id == spotOcoTradeId);
+                if (trade is null || trade.TradeMode != "SPOT" || trade.Side != "BUY" ||
+                    trade.ExchangeCode != "NOBITEX" || trade.ExchangeAccountId is null || trade.Quantity <= 0)
+                    return ("پوزیشن Spot معتبر برای ثبت OCO پیدا نشد یا مقدار آن ثبت نشده است.", TradesMenuKeyboard());
+                var repository = new ManualOrderApprovalRepository(DatabaseConnectionString);
+                if (!repository.TryBeginSpotOcoSubmission(chatId, spotOcoTradeId))
+                    return ("ثبت OCO برای این پوزیشن قبلاً انجام شده، در حال انجام است یا حساب فعال نیست. برای نتیجه، فهرست معاملات باز را تازه‌سازی کن.", TradesMenuKeyboard());
+
+                try
+                {
+                    var marketPrice = await GetNobitexLastPriceAsync(trade.Symbol);
+                    if (marketPrice is null || marketPrice <= 0)
+                    {
+                        repository.CompleteSpotOcoSubmission(chatId, spotOcoTradeId, "Rejected",
+                            Array.Empty<string>(), "Live market price could not be retrieved; no OCO was sent.");
+                        return ("قیمت لحظه‌ای دریافت نشد؛ هیچ OCO ارسال نشد. دوباره تلاش کن.", TradesMenuKeyboard());
+                    }
+
+                    var ocoCredentials = new UserExchangeAccountRepository(DatabaseConnectionString)
+                        .GetCredentials(chatId, trade.ExchangeAccountId.Value);
+                    var result = await NobitexTrading.PlaceSpotOcoExitAsync(ocoCredentials,
+                        new NobitexSpotOcoExitRequest(trade.Symbol, trade.Quantity, marketPrice.Value,
+                            trade.TakeProfit, trade.StopLoss, trade.StopLoss));
+                    string status = result.Accepted ? "Accepted" : result.OutcomeUnknown ? "OutcomeUnknown" : "Rejected";
+                    repository.CompleteSpotOcoSubmission(chatId, spotOcoTradeId, status,
+                        result.ExchangeOrderIds, result.Message);
+                    return (result.Accepted
+                        ? $"✅ OCO برای {trade.Symbol} پذیرفته شد. شناسه سفارش‌ها: {string.Join(", ", result.ExchangeOrderIds)}"
+                        : result.OutcomeUnknown
+                            ? $"⚠️ نتیجه ثبت OCO نامشخص است: {result.Message}\nتا بررسی تاریخچه سفارش‌ها در نوبیتکس، دوباره ارسال نکن."
+                            : $"OCO ثبت نشد: {result.Message}", TradesMenuKeyboard());
+                }
+                catch (Exception ex) when (ex is HttpRequestException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException or KeyNotFoundException)
+                {
+                    repository.CompleteSpotOcoSubmission(chatId, spotOcoTradeId, "Rejected",
+                        Array.Empty<string>(), "Pre-submission verification failed.");
+                    Console.WriteLine($"Spot OCO verification failed for trade {spotOcoTradeId}: {ex.GetType().Name}");
+                    return ("بررسی حساب یا بازار ناموفق بود؛ OCO ارسال نشد. اتصال حساب و دسترسی API را بررسی کن.", TradesMenuKeyboard());
+                }
+            }
+            case "accounts":
+                if (accounts.Count == 0) return ("حسابی متصل نیست. از دکمه زیر برای اتصال حساب نوبیتکس استفاده کن.", new InlineKeyboardMarkup(new[]
+                    { new[] { InlineKeyboardButton.WithCallbackData("➕ اتصال حساب نوبیتکس", "ui|addaccount") }, new[] { InlineKeyboardButton.WithCallbackData("↩️ بازگشت", "ui|accountsmenu") } }));
+                return ("حساب‌های متصل شما:", new InlineKeyboardMarkup(accounts.Select(a => new[]
+                    { InlineKeyboardButton.WithCallbackData($"#{a.Id} {a.ExchangeCode} | {a.AccountLabel} {(a.IsActive ? "🟢" : "⚪")}", $"ui|account|{a.Id}") })
+                    .Append(new[] { InlineKeyboardButton.WithCallbackData("➕ اتصال حساب", "ui|addaccount") })
+                    .Append(new[] { InlineKeyboardButton.WithCallbackData("↩️ منوی اصلی", "ui|home") })));
+            case "addaccount":
+                if (AccountLinkStates.ContainsKey(chatId)) return ("فرآیند اتصال حساب از قبل فعال است. نام حساب، API Key عمومی و کلید خصوصی را به‌ترتیب در مراحل خواسته‌شده ارسال کن؛ برای لغو /cancel را بفرست.", CancelWizardKeyboard());
+                AccountLinkStates[chatId] = new AccountLinkState();
+                return ("اتصال حساب نوبیتکس با API Key جدید\n\nابتدا یک نام دلخواه برای این حساب وارد کن (مثلاً حساب اصلی). سپس API Key عمومی و کلید خصوصی متناظر دریافت می‌شود و هر درخواست با Ed25519 امضا خواهد شد. دسترسی READ لازم است؛ برای معاملات آینده TRADE هم لازم می‌شود. هرگز WITHDRAW را فعال نکن. برای لغو /cancel را بفرست.", CancelWizardKeyboard());
+            case "relink" when p.Length == 3 && long.TryParse(p[2], out var relinkAccountId):
+            {
+                if (AccountLinkStates.ContainsKey(chatId))
+                    return ("فرآیند اتصال حساب دیگری در حال اجراست؛ ابتدا آن را لغو کن.", CancelWizardKeyboard());
+                var legacyAccount = accounts.FirstOrDefault(a => a.Id == relinkAccountId && a.IsActive &&
+                    a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase));
+                if (legacyAccount is null)
+                    return ("حساب فعال نوبیتکس متعلق به شما پیدا نشد.", AccountMenuKeyboard());
+                AccountLinkStates[chatId] = new AccountLinkState
+                {
+                    Step = "apikey",
+                    Label = legacyAccount.AccountLabel,
+                    AccountId = legacyAccount.Id
+                };
+                return ($"به‌روزرسانی کلیدهای حساب «{legacyAccount.AccountLabel}»\n\nAPI Key عمومی جدید را ارسال کن. سپس کلید خصوصی Ed25519 متناظر را می‌گیرم و قبل از ذخیره اعتبارسنجی می‌کنم. کلیدهای قبلی فقط پس از موفقیت اعتبارسنجی جایگزین می‌شوند.", CancelWizardKeyboard());
+            }
+            case "account":
+            {
+                if (p.Length != 3 || !long.TryParse(p[2], out long accountMenuId)) return ("شناسه حساب نامعتبر است.", MainMenuKeyboard());
+                var selected = accounts.FirstOrDefault(a => a.Id == accountMenuId && a.IsActive);
+                if (selected is null) return ("حساب فعال متعلق به شما پیدا نشد.", MainMenuKeyboard());
+                var accountRows = new List<InlineKeyboardButton[]>
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🔌 بررسی اتصال", $"ui|check|{accountMenuId}"), InlineKeyboardButton.WithCallbackData("💰 مشاهده موجودی", $"ui|balance|{accountMenuId}") }
+                };
+                if (selected.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase))
+                    accountRows.Add(new[] { InlineKeyboardButton.WithCallbackData("🔑 به‌روزرسانی API Key و Secret", $"ui|relink|{accountMenuId}") });
+                accountRows.Add(new[] { InlineKeyboardButton.WithCallbackData("⛔ غیرفعال‌کردن حساب", $"ui|deactivate|{accountMenuId}") });
+                accountRows.Add(new[] { InlineKeyboardButton.WithCallbackData("↩️ حساب‌ها", "ui|accounts"), InlineKeyboardButton.WithCallbackData("🏠 منو", "ui|home") });
+                return ($"حساب #{selected.Id}\n{selected.ExchangeCode} | {selected.AccountLabel}", new InlineKeyboardMarkup(accountRows));
+            }
+            case "deactivate":
+                if (p.Length != 3 || !long.TryParse(p[2], out long deactivateId)) return ("شناسه حساب نامعتبر است.", AccountMenuKeyboard());
+                bool deactivated = new UserExchangeAccountRepository(DatabaseConnectionString).Deactivate(chatId, deactivateId);
+                return (deactivated ? "حساب غیرفعال شد. کلیدهای رمزنگاری‌شده در پایگاه داده باقی می‌مانند اما برای عملیات حساب قابل دریافت نیستند." : "حساب فعال متعلق به شما پیدا نشد.", AccountMenuKeyboard());
+            case "check":
+            case "balance":
+                if (p.Length != 3 || !long.TryParse(p[2], out long selectedAccountId)) return ("شناسه حساب نامعتبر است.", MainMenuKeyboard());
+                var account = accounts.FirstOrDefault(a => a.Id == selectedAccountId && a.IsActive);
+                if (account is null) return ("حساب فعال متعلق به شما پیدا نشد.", MainMenuKeyboard());
+                IExchangeAdapter? adapter = account.ExchangeCode.ToUpperInvariant() switch
+                {
+                    "NOBITEX" => NobitexReadOnly,
+                    "BINANCE_TESTNET" => BinanceTestnetReadOnly,
+                    _ => null
+                };
+                if (adapter is null) return ("آداپتر این صرافی موجود نیست.", MainMenuKeyboard());
+                var credentials = new UserExchangeAccountRepository(DatabaseConnectionString).GetCredentials(chatId, selectedAccountId);
+                try
+                {
+                    if (p[1] == "check")
+                    {
+                        bool valid = await adapter.ValidateCredentialsAsync(credentials);
+                        return (valid ? $"✅ اتصال {account.AccountLabel} معتبر است (فقط خواندنی)." : "❌ اعتبارسنجی اتصال ناموفق بود.",
+                            new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("↩️ بازگشت", $"ui|account|{selectedAccountId}") } }));
+                    }
+                    var snapshot = await adapter.GetAccountSnapshotAsync(credentials);
+                    string balances = string.Join("\n", snapshot.Balances.Where(x => x.Total != 0 || x.Locked != 0)
+                        .OrderByDescending(x => x.Total).Take(30)
+                        .Select(x => $"{x.Asset}: کل {x.Total:G29} | آزاد {x.Available:G29} | مسدود {x.Locked:G29}"));
+                    if (string.IsNullOrWhiteSpace(balances)) balances = "موجودی غیرصفر دریافت نشد.";
+                    return ($"💰 موجودی {account.AccountLabel} (فقط خواندنی):\n{balances}",
+                        new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("↩️ بازگشت", $"ui|account|{selectedAccountId}") } }));
+                }
+                catch (Exception ex) when (ex is HttpRequestException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException)
+                { return ("ارتباط با نوبیتکس ناموفق بود؛ API Key، کلید خصوصی متناظر، مجوز READ و ساعت سیستم را بررسی کنید.", MainMenuKeyboard()); }
+            case "balances" or "checkaccounts":
+                var active = accounts.Where(a => a.IsActive).ToList();
+                if (active.Count == 0) return ("حساب فعال ندارید.", MainMenuKeyboard());
+                return (p[1] == "balances" ? "برای مشاهده موجودی، حساب را انتخاب کنید:" : "برای بررسی اتصال، حساب را انتخاب کنید:",
+                    new InlineKeyboardMarkup(active.Select(a => new[] { InlineKeyboardButton.WithCallbackData(
+                        $"{a.ExchangeCode} | {a.AccountLabel}", $"ui|{(p[1] == "balances" ? "balance" : "check")}|{a.Id}") })
+                        .Append(new[] { InlineKeyboardButton.WithCallbackData("↩️ منو", "ui|home") })));
+            case "neworder":
+                ManualUiStates.TryRemove(chatId, out _);
+                var nobitexAccounts = accounts.Where(a => a.IsActive && a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase)).ToList();
+                if (nobitexAccounts.Count == 0) return ("برای ثبت سفارش ابتدا یک حساب فعال نوبیتکس اضافه کنید. Binance فقط خواندنی است.", MainMenuKeyboard());
+                return ("حساب نوبیتکس را انتخاب کنید:", new InlineKeyboardMarkup(nobitexAccounts.Select(a => new[]
+                    { InlineKeyboardButton.WithCallbackData($"#{a.Id} {a.AccountLabel}", $"ui|orderaccount|{a.Id}") })
+                    .Append(new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") })));
+            case "orderaccount":
+                if (p.Length != 3 || !long.TryParse(p[2], out long orderAccountId)) return ("شناسه حساب نامعتبر است.", MainMenuKeyboard());
+                if (!accounts.Any(a => a.Id == orderAccountId && a.IsActive && a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase)))
+                    return ("حساب نوبیتکس معتبر نیست.", MainMenuKeyboard());
+                ManualUiStates.TryRemove(chatId, out _);
+                OrderWizards[chatId] = new OrderWizardState { AccountId = orderAccountId };
+                return ("نوع معامله را انتخاب کنید:", new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🟦 Spot", "ui|mode|spot"), InlineKeyboardButton.WithCallbackData("🟧 Margin / تعهدی", "ui|mode|margin") },
+                    new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") }
+                }));
+            case "mode" when p.Length == 3 && OrderWizards.TryGetValue(chatId, out var modeWizard):
+                if (p[2] == "spot") modeWizard.Mode = ExchangeTradeMode.Spot;
+                else if (p[2] == "margin") modeWizard.Mode = ExchangeTradeMode.Margin;
+                else return ("نوع معامله نامعتبر است.", MainMenuKeyboard());
+                return ("جهت معامله را انتخاب کنید:", new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🟢 خرید / Long", "ui|side|buy"), InlineKeyboardButton.WithCallbackData("🔴 فروش / Short", "ui|side|sell") },
+                    new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") }
+                }));
+            case "side" when p.Length == 3 && OrderWizards.TryGetValue(chatId, out var sideWizard):
+                sideWizard.Side = p[2] == "buy" ? ExchangeOrderSide.Buy : p[2] == "sell" ? ExchangeOrderSide.Sell : (ExchangeOrderSide)(-1);
+                if (!Enum.IsDefined(sideWizard.Side)) return ("جهت نامعتبر است.", MainMenuKeyboard());
+                if (sideWizard.Mode == ExchangeTradeMode.Margin && sideWizard.Side == ExchangeOrderSide.Sell)
+                    sideWizard.Side = ExchangeOrderSide.Sell; // short
+                return ("نوع سفارش را انتخاب کنید:", new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("📌 Limit", "ui|type|limit"),
+                        sideWizard.Mode == ExchangeTradeMode.Spot ? InlineKeyboardButton.WithCallbackData("⚡ Market", "ui|type|market") : InlineKeyboardButton.WithCallbackData("🚫", "ui|noop") },
+                    new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") }
+                }));
+            case "type" when p.Length == 3 && OrderWizards.TryGetValue(chatId, out var typeWizard):
+                if (p[2] == "limit") typeWizard.Type = ExchangeOrderType.Limit;
+                else if (p[2] == "market" && typeWizard.Mode == ExchangeTradeMode.Spot) typeWizard.Type = ExchangeOrderType.Market;
+                else return ("نوع سفارش نامعتبر است.", MainMenuKeyboard());
+                typeWizard.Step = "symbol";
+                return ("نماد را ارسال کنید؛ مثال: BTCUSDT یا BTCIRT", CancelWizardKeyboard());
+            case "noop": return ("این گزینه در این نوع معامله پشتیبانی نمی‌شود.", MainMenuKeyboard());
+            case "open":
+                var open = GetOpenTrades(chatId);
+                if (open.Count == 0) return ("معامله بازی در دفتر شما وجود ندارد.", TradesMenuKeyboard());
+                var openRows = new List<InlineKeyboardButton[]>();
+                foreach (var trade in open)
+                {
+                    openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
+                        $"ثبت خروج: {trade.Side} {trade.Symbol} #{trade.Id}", $"sold|{trade.Id}") });
+                    if (trade.TradeMode == "SPOT" && trade.Side == "BUY" && trade.Quantity > 0 &&
+                        trade.OcoStatus is "NotSubmitted" or "Rejected")
+                        openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
+                            $"🛡 ثبت OCO خروج ({trade.Symbol})", $"ui|spotoco|{trade.Id}") });
+                    else if (trade.TradeMode == "SPOT" && trade.Side == "BUY" && trade.OcoStatus != "NotSubmitted")
+                        openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
+                            $"OCO {trade.Symbol}: {trade.OcoStatus}", "ui|noop") });
+                }
+                openRows.Add(new[] { InlineKeyboardButton.WithCallbackData("↩️ معاملات", "ui|tradesmenu"), InlineKeyboardButton.WithCallbackData("🏠 منو", "ui|home") });
+                return ("معاملات باز دفتر شما\nبرای Spot، پس از ثبت خرید واقعی می‌توانی OCO خروج را در صرافی ثبت کنی. ثبت خروج دستی فقط پس از خروج واقعی استفاده شود:",
+                    new InlineKeyboardMarkup(openRows));
+            case "stats": return (GetPerformanceStats(chatId), AnalysisMenuKeyboard());
+            case "report": return (GetSignalReport(), AnalysisMenuKeyboard());
+            case "rate": return ($"نرخ فعلی تتر: {UsdtTomanRate:N0} تومان", SettingsMenuKeyboard());
+            case "rateedit":
+                OrderWizards.TryRemove(chatId, out _);
+                ManualUiStates[chatId] = new ManualUiState { Action = "rate", Step = "value" };
+                return ($"نرخ جدید تتر به تومان را وارد کنید. نرخ فعلی: {UsdtTomanRate:N0}", CancelWizardKeyboard());
+            case "bought":
+                OrderWizards.TryRemove(chatId, out _);
+                ManualUiStates[chatId] = new ManualUiState { Action = "bought", Step = "symbol" };
+                return ("نماد خریدی که قبلاً در صرافی انجام داده‌ای وارد کن؛ مثال: BTC یا BTCUSDT. این عملیات فقط دفتر معاملات را ثبت می‌کند.", CancelWizardKeyboard());
+            case "buycurrent" when ManualUiStates.TryGetValue(chatId, out var buyCurrent) && buyCurrent.Action == "bought":
+                var buyPrice = await GetNobitexLastPriceAsync(buyCurrent.Symbol);
+                if (buyPrice is null || buyPrice <= 0) return ("قیمت فعلی دریافت نشد؛ می‌توانی قیمت را دستی وارد کنی.", new InlineKeyboardMarkup(new[] { new[] { InlineKeyboardButton.WithCallbackData("✏️ ورود قیمت دستی", "ui|buymanual"), InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") } }));
+                buyCurrent.EntryPrice = buyPrice.Value;
+                return (BuildManualBuyPreview(buyCurrent), ManualBuyApprovalKeyboard());
+            case "buymanual" when ManualUiStates.TryGetValue(chatId, out var buyManual) && buyManual.Action == "bought":
+                buyManual.Step = "price";
+                return ($"قیمت خرید {buyManual.Symbol} را وارد کن:", CancelWizardKeyboard());
+            case "cancelpending":
+                bool removedPending = PendingOrders.Remove(chatId);
+                return (removedPending ? "سفارش معلق لغو شد؛ هیچ سفارشی ارسال نشد." : "سفارش معلقی برای لغو وجود ندارد.", TradesMenuKeyboard());
+            case "buyconfirm" when ManualUiStates.TryGetValue(chatId, out var buyConfirm) && buyConfirm.Action == "bought":
+                if (buyConfirm.EntryPrice <= 0) return ("قیمت خرید معتبر نیست؛ فرآیند را از ابتدا شروع کنید.", TradesMenuKeyboard());
+                if (HasOpenTrade(chatId, buyConfirm.Symbol, "SPOT")) return (($"قبلاً معامله باز روی {buyConfirm.Symbol} داری."), TradesMenuKeyboard());
+                OpenTrade(chatId, buyConfirm.Symbol, buyConfirm.EntryPrice, buyConfirm.EntryPrice * 0.985m,
+                    buyConfirm.EntryPrice * 1.03m, "BUY", 1, "SPOT");
+                ManualUiStates.TryRemove(chatId, out _);
+                return (($"✅ خرید {buyConfirm.Symbol} در دفتر ثبت شد.\nقیمت ورود: {buyConfirm.EntryPrice:N4}\nهیچ سفارشی به صرافی ارسال نشد."), TradesMenuKeyboard());
+            case "stop": SetUserActive(chatId, false); return ("سیگنال‌ها متوقف شدند.", MainMenuKeyboard());
+            case "start": SetUserActive(chatId, true); return ("سیگنال‌ها فعال شدند.", MainMenuKeyboard());
+            default: return ("گزینه نامعتبر است.", MainMenuKeyboard());
+        }
+    }
+
+    static InlineKeyboardMarkup CancelWizardKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel"), InlineKeyboardButton.WithCallbackData("🏠 منو", "ui|home") }
+    });
+
+    static InlineKeyboardMarkup ManualBuyApprovalKeyboard() => new(new[]
+    {
+        new[] { InlineKeyboardButton.WithCallbackData("✅ ثبت خرید در دفتر", "ui|buyconfirm"), InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") }
+    });
+
+    static string BuildManualBuyPreview(ManualUiState state) =>
+        $"پیش‌نمایش ثبت خرید در دفتر\nنماد: {state.Symbol}\nقیمت ورود: {state.EntryPrice:N4}\n" +
+        $"SL اولیه: {state.EntryPrice * 0.985m:N4}\nTP اولیه: {state.EntryPrice * 1.03m:N4}\n\n" +
+        "این فقط ثبت سابقه معامله است و هیچ سفارش خریدی به صرافی ارسال نمی‌کند.";
+
+    static async Task<(string Text, InlineKeyboardMarkup? Keyboard)> HandleOrderWizardInput(long chatId, string input)
+    {
+        if (!OrderWizards.TryGetValue(chatId, out var state)) return ("فرآیند سفارش فعال نیست.", MainMenuKeyboard());
+        string value = NormalizeDigits(input.Trim());
+        bool TryNumber(out decimal number) => decimal.TryParse(value.Replace(",", "").Replace("،", ""),
+            System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out number) && number > 0;
+        switch (state.Step)
+        {
+            case "budget" when state.IsSignalTrade && state.Mode == ExchangeTradeMode.Spot && state.Side == ExchangeOrderSide.Buy:
+            {
+                if (!TryNumber(out var budgetUsdt) || budgetUsdt < 11m)
+                    return ("بودجه باید حداقل ۱۱ USDT و عددی مثبت باشد.", CancelWizardKeyboard());
+                try
+                {
+                    var credentials = new UserExchangeAccountRepository(DatabaseConnectionString)
+                        .GetCredentials(chatId, state.AccountId);
+                    var snapshot = await NobitexReadOnly.GetAccountSnapshotAsync(credentials);
+                    var usdt = snapshot.Balances.FirstOrDefault(x => x.Asset.Equals("USDT", StringComparison.OrdinalIgnoreCase));
+                    if (!snapshot.Authenticated || usdt is null || budgetUsdt > usdt.Available)
+                        return ($"موجودی آزاد USDT کافی نیست. موجودی آزاد فعلی: {usdt?.Available ?? 0m:N8} USDT", CancelWizardKeyboard());
+
+                    var marketPrice = await GetNobitexLastPriceAsync(state.Symbol);
+                    if (marketPrice is null || marketPrice <= 0)
+                        return ("قیمت لحظه‌ای نوبیتکس دریافت نشد؛ هیچ پیش‌نویسی ساخته نشد. دوباره تلاش کن.", CancelWizardKeyboard());
+                    if (state.SignalEntryPrice <= 0 || state.StopLoss is not > 0 || state.TakeProfit is not > 0)
+                        return ("حد ضرر/سود پیشنهاد معتبر نیست؛ پیش‌نویس ساخته نشد.", CancelWizardKeyboard());
+
+                    decimal riskPercent = (state.SignalEntryPrice - state.StopLoss.Value) / state.SignalEntryPrice;
+                    decimal rewardPercent = (state.TakeProfit.Value - state.SignalEntryPrice) / state.SignalEntryPrice;
+                    if (riskPercent <= 0 || rewardPercent <= 0 || riskPercent > 0.10m || rewardPercent < riskPercent * 1.2m)
+                        return ("نسبت ریسک/بازده پیشنهاد معتبر نیست؛ پیش‌نویس ساخته نشد.", CancelWizardKeyboard());
+
+                    // Nobitex expects the base-asset quantity, not the USDT budget.
+                    // Keep a small reserve for fees/slippage and always round quantity down.
+                    decimal signalBuyGuard = marketPrice.Value * (1m + Math.Min(0.005m, rewardPercent / 2m));
+                    decimal computedQuantity = Math.Floor((budgetUsdt / signalBuyGuard * 0.995m) * 100_000_000m) / 100_000_000m;
+                    if (computedQuantity <= 0 || computedQuantity * marketPrice.Value < 11m)
+                        return ("ارزش سفارش پس از ذخیره کارمزد/لغزش کمتر از حداقل ۱۱ USDT است.", CancelWizardKeyboard());
+
+                    state.Quantity = computedQuantity;
+                    state.RequestedBudgetUsdt = budgetUsdt;
+                    state.PriceGuard = signalBuyGuard;
+                    state.StopLoss = marketPrice.Value * (1m - riskPercent);
+                    state.TakeProfit = marketPrice.Value * (1m + rewardPercent);
+                    return await CreateWizardApproval(chatId, state);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException or KeyNotFoundException)
+                {
+                    Console.WriteLine($"Signal Spot buy preflight failed for {state.Symbol}: {ex.GetType().Name}");
+                    return ("دریافت موجودی یا قیمت نوبیتکس ناموفق بود؛ هیچ سفارشی ارسال نشد. اتصال حساب و دسترسی API را بررسی کن.", CancelWizardKeyboard());
+                }
+            }
+            case "quantity" when state.IsSignalTrade && state.Mode == ExchangeTradeMode.Spot && state.Side == ExchangeOrderSide.Sell:
+            {
+                if (!TryNumber(out var sellQuantity))
+                    return ("مقدار فروش باید عددی مثبت باشد.", CancelWizardKeyboard());
+                try
+                {
+                    var credentials = new UserExchangeAccountRepository(DatabaseConnectionString)
+                        .GetCredentials(chatId, state.AccountId);
+                    var snapshot = await NobitexReadOnly.GetAccountSnapshotAsync(credentials);
+                    string baseAsset = state.Symbol[..^4];
+                    var asset = snapshot.Balances.FirstOrDefault(x => x.Asset.Equals(baseAsset, StringComparison.OrdinalIgnoreCase));
+                    if (!snapshot.Authenticated || asset is null || sellQuantity > asset.Available)
+                        return ($"موجودی آزاد {baseAsset} کافی نیست. موجودی آزاد: {asset?.Available ?? 0m:G29}", CancelWizardKeyboard());
+                    var marketPrice = await GetNobitexLastPriceAsync(state.Symbol);
+                    if (marketPrice is null || marketPrice <= 0)
+                        return ("قیمت لحظه‌ای نوبیتکس دریافت نشد؛ هیچ پیش‌نویسی ساخته نشد.", CancelWizardKeyboard());
+                    if (sellQuantity * marketPrice.Value < 11m)
+                        return ("ارزش سفارش فروش باید حداقل ۱۱ USDT باشد.", CancelWizardKeyboard());
+                    state.Quantity = sellQuantity;
+                    state.PriceGuard = marketPrice.Value * 0.995m;
+                    return await CreateWizardApproval(chatId, state);
+                }
+                catch (Exception ex) when (ex is HttpRequestException or UnauthorizedAccessException or InvalidDataException or System.Text.Json.JsonException or KeyNotFoundException)
+                {
+                    Console.WriteLine($"Signal Spot sell preflight failed for {state.Symbol}: {ex.GetType().Name}");
+                    return ("دریافت موجودی یا قیمت نوبیتکس ناموفق بود؛ هیچ سفارشی ساخته نشد.", CancelWizardKeyboard());
+                }
+            }
+            case "symbol":
+                string symbol = value.Replace("/", "").Replace("-", "").ToUpperInvariant();
+                if (symbol.Length is < 6 or > 20 || !symbol.All(char.IsAsciiLetter)) return ("نماد معتبر نیست. نمونه: BTCUSDT", CancelWizardKeyboard());
+                state.Symbol = symbol; state.Step = "quantity";
+                return ("مقدار سفارش را وارد کنید؛ مثال: 0.001", CancelWizardKeyboard());
+            case "quantity":
+                if (!TryNumber(out var quantity)) return ("مقدار باید عددی مثبت باشد.", CancelWizardKeyboard());
+                state.Quantity = quantity;
+                if (state.Mode == ExchangeTradeMode.Margin) { state.Step = "leverage"; return ("اهرم را وارد کنید؛ مثال: 2 یا 1.5", CancelWizardKeyboard()); }
+                state.Step = state.Type == ExchangeOrderType.Limit ? "price" : "guard";
+                return (state.Type == ExchangeOrderType.Limit ? "قیمت Limit را وارد کنید:" : "Price Guard را برای محدود کردن لغزش قیمت وارد کنید:", CancelWizardKeyboard());
+            case "leverage":
+                if (!TryNumber(out var leverage) || leverage < 1 || leverage > 20 || leverage * 2m % 1m != 0)
+                    return ("اهرم باید بین ۱ تا ۲۰ و با گام ۰٫۵ باشد.", CancelWizardKeyboard());
+                state.Leverage = leverage; state.Step = "price";
+                return ("قیمت ورود Limit را وارد کنید:", CancelWizardKeyboard());
+            case "price":
+                if (!TryNumber(out var price)) return ("قیمت باید مثبت باشد.", CancelWizardKeyboard());
+                state.LimitPrice = price;
+                if (state.Mode == ExchangeTradeMode.Margin ||
+                    (state.Mode == ExchangeTradeMode.Spot && state.Side == ExchangeOrderSide.Buy))
+                { state.Step = "sl"; return ("قیمت حد ضرر (Stop Loss) را وارد کنید:", CancelWizardKeyboard()); }
+                return await CreateWizardApproval(chatId, state);
+            case "guard":
+                if (!TryNumber(out var guard)) return ("Price Guard باید مثبت باشد.", CancelWizardKeyboard());
+                state.PriceGuard = guard;
+                if (state.Side == ExchangeOrderSide.Buy)
+                { state.Step = "sl"; return ("قیمت حد ضرر (Stop Loss) را وارد کنید:", CancelWizardKeyboard()); }
+                return await CreateWizardApproval(chatId, state);
+            case "sl":
+                if (!TryNumber(out var sl)) return ("Stop Loss باید مثبت باشد.", CancelWizardKeyboard());
+                state.StopLoss = sl; state.Step = "tp";
+                return ("قیمت Take Profit را وارد کنید:", CancelWizardKeyboard());
+            case "tp":
+                if (!TryNumber(out var tp)) return ("Take Profit باید مثبت باشد.", CancelWizardKeyboard());
+                state.TakeProfit = tp;
+                return await CreateWizardApproval(chatId, state);
+            default: return ("مرحله نامعتبر است؛ فرآیند را از ابتدا آغاز کنید.", MainMenuKeyboard());
+        }
+    }
+
+    static string NormalizeDigits(string value)
+    {
+        return value.Replace('۰', '0').Replace('۱', '1').Replace('۲', '2').Replace('۳', '3')
+            .Replace('۴', '4').Replace('۵', '5').Replace('۶', '6').Replace('۷', '7')
+            .Replace('۸', '8').Replace('۹', '9').Replace('٠', '0').Replace('١', '1')
+            .Replace('٢', '2').Replace('٣', '3').Replace('٤', '4').Replace('٥', '5')
+            .Replace('٦', '6').Replace('٧', '7').Replace('٨', '8').Replace('٩', '9');
+    }
+
+    static async Task<(string Text, InlineKeyboardMarkup? Keyboard)> HandleManualUiInput(long chatId, string input)
+    {
+        if (!ManualUiStates.TryGetValue(chatId, out var state)) return ("فرآیند فعالی وجود ندارد.", MainMenuKeyboard());
+        string value = NormalizeDigits(input.Trim()).Replace(",", "").Replace("،", "");
+        if (state.Action == "registerapproved" && state.Step == "entryprice")
+        {
+            if (!decimal.TryParse(value, System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var actualEntry) || actualEntry <= 0)
+                return ("قیمت اجرای واقعی باید عددی مثبت باشد.", CancelWizardKeyboard());
+
+            bool registered = state.ApprovalId is not null &&
+                new ManualOrderApprovalRepository(DatabaseConnectionString)
+                    .RegisterAsOpenPosition(chatId, state.ApprovalId, actualEntry);
+            ManualUiStates.TryRemove(chatId, out _);
+            return (registered
+                ? $"✅ پوزیشن {state.ApprovalId![..8]} در دفتر معاملات شما ثبت شد. قیمت ورود واقعی: {actualEntry:N4}. پایش حد ضرر/سود فعال است؛ خروج همچنان باید در صرافی دستی انجام شود."
+                : "ثبت پوزیشن انجام نشد؛ ممکن است درخواست متعلق به شما نباشد، حساب غیرفعال شده یا قبلاً ثبت شده باشد.", TradesMenuKeyboard());
+        }
+        if (state.Action == "rate")
+        {
+            if (!decimal.TryParse(value, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var rate) || rate < 1000)
+                return ("نرخ معتبر نیست؛ عددی حداقل ۱۰۰۰ تومان وارد کن.", CancelWizardKeyboard());
+            UsdtTomanRate = rate;
+            ManualUiStates.TryRemove(chatId, out _);
+            return (($"✅ نرخ تتر به {UsdtTomanRate:N0} تومان تغییر کرد."), SettingsMenuKeyboard());
+        }
+        if (state.Action == "bought" && state.Step == "symbol")
+        {
+            string symbol = value.Replace("/", "").Replace("-", "").ToUpperInvariant();
+            if (symbol.Length is < 3 or > 20 || !symbol.All(char.IsAsciiLetter))
+                return ("نماد معتبر نیست؛ مثال BTC یا BTCUSDT.", CancelWizardKeyboard());
+            if (!symbol.EndsWith("USDT", StringComparison.Ordinal)) symbol += "USDT";
+            state.Symbol = symbol;
+            return ($"نماد {symbol} انتخاب شد. قیمت مرجع را از بازار بگیرم یا دستی وارد می‌کنی؟", new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("💹 استفاده از قیمت فعلی", "ui|buycurrent"), InlineKeyboardButton.WithCallbackData("✏️ ورود قیمت دستی", "ui|buymanual") },
+                new[] { InlineKeyboardButton.WithCallbackData("❌ لغو", "ui|cancel") }
+            }));
+        }
+        if (state.Action == "bought" && state.Step == "price")
+        {
+            if (!decimal.TryParse(value, System.Globalization.NumberStyles.Number, System.Globalization.CultureInfo.InvariantCulture, out var entry) || entry <= 0)
+                return ("قیمت باید عددی مثبت باشد.", CancelWizardKeyboard());
+            state.EntryPrice = entry;
+            return (BuildManualBuyPreview(state), ManualBuyApprovalKeyboard());
+        }
+        return ("مرحله ورودی نامعتبر است؛ فرآیند را لغو و دوباره شروع کن.", CancelWizardKeyboard());
+    }
+
+    static Task<(string Text, InlineKeyboardMarkup? Keyboard)> CreateWizardApproval(long chatId, OrderWizardState state)
+    {
+        try
+        {
+            var repository = new ManualOrderApprovalRepository(DatabaseConnectionString);
+            string approvalId = repository.Create(new ManualOrderDraft(chatId, state.AccountId, "NOBITEX", state.Symbol,
+                state.Mode, state.Side, state.Type, state.Quantity, state.LimitPrice,
+                state.StopLoss, state.TakeProfit, state.Leverage, state.PriceGuard));
+            OrderWizards.TryRemove(chatId, out _);
+            string side = state.Mode == ExchangeTradeMode.Spot ? state.Side.ToString().ToUpperInvariant() :
+                state.Side == ExchangeOrderSide.Buy ? "LONG" : "SHORT";
+            string preview = $"⚠️ پیش‌نمایش سفارش نوبیتکس (۵ دقیقه)\nحساب: #{state.AccountId}\n{state.Mode} {side} {state.Symbol}\n" +
+                $"نوع: {state.Type} | مقدار: {state.Quantity}\n" +
+                (state.RequestedBudgetUsdt is decimal budget ? $"بودجه درخواستی: {budget:N4} USDT\n" : "") +
+                (state.LimitPrice is null ? "" : $"قیمت ورود: {state.LimitPrice}\n") +
+                (state.PriceGuard is null ? "" : $"Price Guard: {state.PriceGuard}\n") +
+                (state.StopLoss is not null && state.TakeProfit is not null
+                    ? (state.Mode == ExchangeTradeMode.Margin ? $"اهرم: {state.Leverage}x\n" : "") +
+                      $"حد ضرر: {state.StopLoss} | حد سود: {state.TakeProfit}\n" : "") +
+                (state.Mode == ExchangeTradeMode.Spot && state.Side == ExchangeOrderSide.Buy
+                    ? "پس از اجرای دستی خرید و ثبت قیمت/مقدار واقعی پوزیشن، می‌توانی OCO خروج را از فهرست معاملات باز به نوبیتکس ارسال کنی.\n" : "") +
+                "\nتأیید این مرحله فقط پیش‌نویس را تأیید می‌کند؛ ارسال سفارش واقعی هنوز غیرفعال است.";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("✅ تأیید پیش‌نویس", $"approve_order|{approvalId}"),
+                        InlineKeyboardButton.WithCallbackData("❌ رد سفارش", $"reject_order|{approvalId}") },
+                new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
+            });
+            return Task.FromResult((preview, (InlineKeyboardMarkup?)keyboard));
+        }
+        catch (Exception ex)
+        {
+            OrderWizards.TryRemove(chatId, out _);
+            Console.WriteLine($"CreateWizardApproval failed for chat {chatId}: {ex}");
+            return Task.FromResult(("ساخت پیش‌نویس ناموفق بود. جزئیات خطا در گزارش برنامه ثبت شد.", (InlineKeyboardMarkup?)MainMenuKeyboard()));
+        }
+    }
+
     static async Task<string> HandleCallback(long chatId, string data, BinanceRestClient client)
     {
         if (string.IsNullOrWhiteSpace(data))
             return "دستور نامعتبر";
 
         // ----- دکمه‌های کوتاه exec_xxx / note_xxx -----
-        if (data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase) ||
-            data.StartsWith("note_", StringComparison.OrdinalIgnoreCase))
+        if (data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase))
         {
             return "خرید/فروش خودکار فعلاً غیرفعال است.\nفقط سیگنال‌ها ارسال می‌شوند.";
+        }
 
-            bool isExec = data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase);
+        if (data.StartsWith("note_", StringComparison.OrdinalIgnoreCase))
+        {
             string id = data[(data.IndexOf('_') + 1)..];
 
             if (!TryGetPayload(id, out var full))
@@ -846,42 +1585,26 @@ WHERE Symbol=$s AND Status='Pending'";
             if (p.Length < 6)
                 return "داده سیگنال ناقص است.";
 
-            string side = p[0].Equals("short", StringComparison.OrdinalIgnoreCase) ? "SHORT" : "LONG";
+            string side = p[0].ToUpperInvariant() switch
+            {
+                "SHORT" => "SHORT",
+                "BUY" => "BUY",
+                "SELL" => "SELL",
+                _ => "LONG"
+            };
             string symbol = p[1];
+            string tradeMode = p.Length >= 7 ? p[6].ToUpperInvariant() : "MARGIN";
             decimal entry = decimal.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture);
             decimal sl = decimal.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture);
             decimal tp = decimal.Parse(p[4], System.Globalization.CultureInfo.InvariantCulture);
             int lev = int.TryParse(p[5], out var lv) ? Math.Min(lv, 3) : 1;
 
-            if (isExec)
-            {
-                PendingOrders[chatId] = new PendingOrder
-                {
-                    Side = side,
-                    Symbol = symbol,
-                    Entry = entry,
-                    StopLoss = sl,
-                    TakeProfit = tp,
-                    Leverage = lev,
-                    BudgetToman = null
-                };
-
-                return
-                    $"💰 {side} {symbol}\n" +
-                    $"Entry≈ {entry:N4}\n\n" +
-                    $"چقدر تومان می‌خوای درگیر کنی؟\n" +
-                    $"فقط عدد بفرست، مثال:\n300000\n\n" +
-                    $"نرخ تقریبی تتر: {UsdtTomanRate:N0} تومان\n" +
-                    $"(تغییر نرخ: /rate 95000)\n" +
-                    $"لغو: /cancel";
-            }
-
             // note = فقط یادداشت در ربات
-            if (HasOpenTrade(chatId, symbol))
+            if (HasOpenTrade(chatId, symbol, tradeMode))
                 return $"قبلاً معامله باز روی {symbol} داری.";
 
-            OpenTrade(chatId, symbol, entry, sl, tp, side, lev);
-            return $"📝 یادداشت شد (بدون سفارش صرافی)\n{side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}";
+            OpenTrade(chatId, symbol, entry, sl, tp, side, lev, tradeMode);
+            return $"📝 در دفتر معاملات ثبت شد (بدون سفارش صرافی)\n{tradeMode} {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\n\nاین ثبت فقط پس از انجام دستی معامله در صرافی باید انجام شود.";
         }
 
         if (data.StartsWith("skip_", StringComparison.OrdinalIgnoreCase))
@@ -893,6 +1616,29 @@ WHERE Symbol=$s AND Status='Pending'";
             return "لغو شد.";
         }
 
+        var approvalParts = data.Split('|');
+        if (approvalParts.Length == 2 && approvalParts[0] == "approve_order")
+        {
+            var result = new ManualOrderApprovalRepository(DatabaseConnectionString)
+                .ApproveForManualExecution(chatId, approvalParts[1]);
+            return result switch
+            {
+                ApprovalTransitionResult.Updated => "✅ درخواست تأیید شد و برای اجرای دستی آماده است. هیچ سفارشی به صرافی ارسال نشد.",
+                ApprovalTransitionResult.Expired => "مهلت تأیید تمام شده؛ پیش‌نمایش جدید بساز.",
+                ApprovalTransitionResult.AccountInactive => "حساب صرافی غیرفعال شده است.",
+                ApprovalTransitionResult.NotFound => "درخواست پیدا نشد یا متعلق به شما نیست.",
+                _ => "این درخواست قبلاً تعیین‌تکلیف شده است."
+            };
+        }
+
+        if (approvalParts.Length == 2 && approvalParts[0] == "reject_order")
+        {
+            var result = new ManualOrderApprovalRepository(DatabaseConnectionString).Reject(chatId, approvalParts[1]);
+            return result == ApprovalTransitionResult.Updated
+                ? "درخواست رد شد. هیچ سفارشی ارسال نشد."
+                : "درخواست پیدا نشد یا قبلاً تعیین‌تکلیف شده است.";
+        }
+
         // ----- بقیه با | -----
         var parts = data.Split('|');
         if (parts.Length == 0)
@@ -901,59 +1647,25 @@ WHERE Symbol=$s AND Status='Pending'";
         if (parts[0] == "skip")
             return "لغو شد.";
 
+        if (parts[0] == "sold" && parts.Length >= 2 && int.TryParse(parts[1], out int tradeId))
+        {
+            var trade = GetOpenTrades(chatId).FirstOrDefault(t => t.Id == tradeId);
+            if (trade is null) return "معامله بازی پیدا نشد.";
+            var livePrice = await GetNobitexLastPriceAsync(trade.Symbol);
+            if (livePrice is null || livePrice <= 0)
+                return "قیمت فعلی دریافت نشد؛ معامله در دفتر باز باقی ماند.";
+
+            CloseTrade(trade.Id, livePrice.Value, "UserConfirmedManualExit");
+            decimal pnl = CalcPnlPercent(trade.Side, trade.EntryPrice, livePrice.Value);
+            return $"✅ خروج دستی در دفتر ثبت شد: {trade.TradeMode} {trade.Side} {trade.Symbol}\n" +
+                   $"Exit: {livePrice.Value:N4}\nPnL: {pnl:N2}%\n" +
+                   "این دکمه سفارش صرافی ارسال نمی‌کند؛ فقط دفتر معاملات را به‌روزرسانی می‌کند.";
+        }
+
         if (parts[0] == "confirm_pending")
         {
             PendingOrders.Remove(chatId);
-            return "ثبت سفارش روی نوبیتکس فعلاً خاموش است.";
-
-            if (!PendingOrders.TryGetValue(chatId, out var pend) || pend.BudgetToman is null)
-                return "سفارش معلقی نیست. دوباره از سیگنال شروع کن.";
-
-            if (UsdtTomanRate <= 0)
-                return "نرخ تتر نامعتبر است. با /rate تنظیم کن.";
-
-            if (HasOpenTrade(chatId, pend.Symbol))
-            {
-                PendingOrders.Remove(chatId);
-                return $"قبلاً معامله باز روی {pend.Symbol} داری.";
-            }
-
-            decimal usdtBudget = pend.BudgetToman.Value / UsdtTomanRate;
-            int lev = Math.Clamp(pend.Leverage, 1, 3);
-            decimal notional = usdtBudget * lev;
-            decimal amountSrc = Math.Round(notional / pend.Entry, 6);
-
-            if (amountSrc <= 0)
-                return "حجم صفر شد.";
-
-            decimal limitPrice = pend.Side == "SHORT"
-                ? pend.Entry * 0.995m
-                : pend.Entry * 1.005m;
-
-            var order = await PlaceNobitexMarginOrderAsync(
-    pend.Symbol,
-    pend.Side,
-    lev,
-    amountSrc,
-    limitPrice,
-    pend.StopLoss,
-    pend.TakeProfit);
-
-            PendingOrders.Remove(chatId);
-
-            if (!order.Ok)
-                return $"❌ سفارش ناموفق:\n{order.Error}";
-
-            decimal fill = order.FillPrice ?? pend.Entry;
-            OpenTrade(chatId, pend.Symbol, fill, pend.StopLoss, pend.TakeProfit, pend.Side, lev);
-
-            return $"✅ سفارش تعهدی ارسال شد\n" +
-                   $"{pend.Side} {pend.Symbol}\n" +
-                   $"مبلغ: {pend.BudgetToman:N0} تومان\n" +
-                   $"≈ {usdtBudget:N2} USDT | lev {lev}x\n" +
-                   $"amount={amountSrc}\n" +
-                   $"Fill≈ {fill:N4}\n" +
-                   $"OrderId: {order.OrderId}";
+            return "ارسال سفارش در این نسخه غیرفعال است؛ این مرحله فقط ثبت و بررسی دستی سیگنال را پشتیبانی می‌کند.";
         }
 
         // سازگاری قدیمی: long| / short| / bought| → فقط یادداشت
@@ -998,7 +1710,7 @@ WHERE Symbol=$s AND Status='Pending'";
         if (parts[0] == "skip")
             return "لغو شد.";
 
-        return "دستور نامعتبر";
+        return "از منوی دکمه‌ای زیر استفاده کنید:";
     }
 
     static async Task<string> HandleUserCommand(long chatId, string text, BinanceRestClient client)
@@ -1026,7 +1738,7 @@ WHERE Symbol=$s AND Status='Pending'";
                     $"اگر دکمه تأیید نیامد، دوباره روی سیگنال بزن یا در Listen بلوک Pending را فعال کن.";
             }
 
-            return "برای ورود از دکمه سیگنال استفاده کن؛ بعد مبلغ را بفرست.\nلغو: /cancel";
+            return "برای ورود از دکمه سیگنال استفاده کن؛ بعد مبلغ را بفرست. برای لغو از دکمه لغو استفاده کن.";
         }
 
         if (text.StartsWith("/")) text = text[1..];
@@ -1045,7 +1757,7 @@ WHERE Symbol=$s AND Status='Pending'";
                     System.Globalization.CultureInfo.InvariantCulture,
                     out var rate) || rate < 1000)
             {
-                return $"نرخ فعلی تتر: {UsdtTomanRate:N0} تومان\nمثال: /rate";
+                return $"نرخ فعلی تتر: {UsdtTomanRate:N0} تومان\nبرای تغییر نرخ از بخش تنظیمات استفاده کنید.";
             }
             UsdtTomanRate = rate;
             return $"✅ نرخ تتر: {UsdtTomanRate:N0} تومان";
@@ -1069,18 +1781,20 @@ WHERE Symbol=$s AND Status='Pending'";
         if (action == "cancel")
         {
             PendingOrders.Remove(chatId);
-            return "سفارش معلق لغو شد.";
+            OrderWizards.TryRemove(chatId, out _);
+            ManualUiStates.TryRemove(chatId, out _);
+            return "فرآیند ورودی و سفارش معلق لغو شد. پیش‌نویس‌های تأیید سفارش را از دکمه رد همان پیام تعیین‌تکلیف کنید.";
         }
 
         if (parts.Length < 2)
-            return "فرمت:\n/bought BTCUSDT\n/sold BTCUSDT\n/open\n/stats\n/report\n/rate 95000";
+            return "برای ثبت خرید، خروج دستی، معاملات باز و گزارش‌ها از منوی دکمه‌ای استفاده کنید.";
 
         string symbol = parts[1].ToUpperInvariant();
         if (!symbol.EndsWith("USDT")) symbol += "USDT";
 
         if (action == "bought")
         {
-            if (HasOpenTrade(chatId, symbol))
+            if (HasOpenTrade(chatId, symbol, "SPOT"))
                 return $"قبلاً معامله باز روی {symbol} داری.";
 
             decimal entry;
@@ -1097,7 +1811,7 @@ WHERE Symbol=$s AND Status='Pending'";
 
             decimal sl = entry * 0.985m;
             decimal tp = entry * 1.03m;
-            OpenTrade(chatId, symbol, entry, sl, tp, "LONG", 1);
+            OpenTrade(chatId, symbol, entry, sl, tp, "BUY", 1, "SPOT");
             return $"✅ ثبت شد: خرید {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}";
         }
 
@@ -1134,7 +1848,7 @@ WHERE Symbol=$s AND Status='Pending'";
 
     // ==================== تحلیل ====================
 
-    static async Task<(string Text, InlineKeyboardMarkup? Keyboard)?> AnalyzeSymbol(
+    static async Task<List<(string Text, InlineKeyboardMarkup? Keyboard)>?> AnalyzeSymbol(
     BinanceRestClient client, string symbol)
     {
         try
@@ -1152,20 +1866,18 @@ WHERE Symbol=$s AND Status='Pending'";
             if (price <= 0) return null;
 
             if (IsStablePair(symbol, price)) return null;
-            if (HasPendingSignal(symbol)) return null;
 
             var a15 = AnalyzeTimeframe(data15m);
             var a1h = AnalyzeTimeframe(data1h);
+            if (!a15.IsValid || !a1h.IsValid) return null;
             var (support, resistance) = FindSupportResistance(data1h);
 
             var sma50 = data1h.GetSma(50).Last().Sma;
             bool aboveSma50 = sma50 is not null && price >= (decimal)sma50.Value;
             bool belowSma50 = sma50 is not null && price <= (decimal)sma50.Value;
 
-            double distSup = support > 0 ? (double)((price - support) / price * 100) : 100;
-            double distRes = resistance > 0 ? (double)((resistance - price) / price * 100) : 100;
-            bool nearSupport = distSup <= 2.0;
-            bool nearResistance = distRes <= 2.0;
+            bool nearSupport = StrategyRules.IsNearSupport(price, support);
+            bool nearResistance = StrategyRules.IsNearResistance(price, resistance);
 
             int buyScore = a15.BuyScore + a1h.BuyScore;
             int sellScore = a15.SellScore + a1h.SellScore;
@@ -1177,9 +1889,6 @@ WHERE Symbol=$s AND Status='Pending'";
             if (bothBearish) sellScore += 2;
             if (nearSupport) buyScore += 2;
             if (nearResistance) sellScore += 2;
-            if (aboveSma50) buyScore += 1;
-            if (belowSma50) sellScore += 1;
-
             // سرعت: AI فقط نزدیک سیگنال
             if (buyScore < 4 && sellScore < 4)
                 return null;
@@ -1191,7 +1900,7 @@ WHERE Symbol=$s AND Status='Pending'";
             string? side = null;
 
             // LONG
-            if (aiScore > -2 &&
+            if (aiScore >= 0 &&
                 buyScore >= 6 && buyScore >= sellScore + 2 &&
                 a15.Rsi < 65 && a1h.Rsi < 70 &&
                 (nearSupport || aboveSma50) &&
@@ -1200,7 +1909,7 @@ WHERE Symbol=$s AND Status='Pending'";
                 side = "LONG";
             }
             // SHORT
-            else if (aiScore < 2 &&
+            else if (aiScore <= 0 &&
                      sellScore >= 6 && sellScore >= buyScore + 2 &&
                      a15.Rsi > 35 && a1h.Rsi > 30 &&
                      (nearResistance || belowSma50) &&
@@ -1209,87 +1918,66 @@ WHERE Symbol=$s AND Status='Pending'";
                 side = "SHORT";
             }
 
-            if (side == null)
-                return null;
+            var results = new List<(string Text, InlineKeyboardMarkup? Keyboard)>();
 
-            decimal stopLoss, takeProfit;
+            // Spot is a separate, unleveraged strategy. It only creates BUY ideas;
+            // SELL recommendations are generated per user's existing Spot holding.
+            bool spotBuy = aiScore >= 0 && buyScore >= 5 && buyScore >= sellScore + 1 &&
+                           a15.Rsi < 70 && a1h.Rsi < 75 &&
+                           (bothBullish || nearSupport || aboveSma50);
+            if (spotBuy)
+                AddSignal("SPOT", "BUY", TradeSide.Buy, 1);
 
-            if (side == "LONG")
+            if (side is not null)
+                AddSignal("MARGIN", side, side == "LONG" ? TradeSide.Long : TradeSide.Short, 1);
+
+            return results.Count == 0 ? null : results;
+
+            void AddSignal(string mode, string signalSide, TradeSide tradeSide, int leverage)
             {
-                stopLoss = (support > 0 && support < price) ? support * 0.995m : price * 0.985m;
-                takeProfit = (resistance > 0 && resistance > price)
-                    ? Math.Min(resistance * 0.997m, price * 1.03m)
-                    : price * 1.025m;
+                if (HasPendingSignal(symbol, mode)) return;
+                if (!StrategyRules.TryCreatePlan(tradeSide, price, support, resistance, out var plan)) return;
+                if (mode == "MARGIN") leverage = SuggestLeverage(plan.RiskPercent);
+
+                decimal rewardPercent = plan.RewardRiskRatio * plan.RiskPercent;
+                Console.WriteLine($"{symbol,-12} | {price,12:N4} | {mode} {signalSide} | B:{buyScore} S:{sellScore}");
+                SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, $"{mode}_{signalSide}");
+                TrackSignal(symbol, price, plan.StopLoss, plan.TakeProfit, signalSide, mode);
+
+                string emoji = signalSide is "LONG" or "BUY" ? "🟢" : "🔴";
+                string text =
+                    $"{emoji} {mode} {signalSide} {symbol}\n" +
+                    $"Entry: {price:N4} (Nobitex)\n" +
+                    $"Support: {support:N4} | Resistance: {resistance:N4}\n" +
+                    $"Stop Loss: {plan.StopLoss:N4} ({plan.RiskPercent:N2}%)\n" +
+                    $"Take Profit: {plan.TakeProfit:N4} ({rewardPercent:N2}%)\n" +
+                    $"R/R: 1:{plan.RewardRiskRatio:N2}\n" +
+                    (mode == "SPOT" ? "بازار: Spot (بدون اهرم)\n" : $"بازار: Margin | اهرم پیشنهادی: {leverage}x\n") +
+                    $"Score B/S: {buyScore}/{sellScore}\n" +
+                    $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
+                    $"AI/News: {aiScore} ({aiReason})\n\n" +
+                    "این فقط پیشنهاد تحلیلی است؛ سفارش فقط پس از تأیید دستی و اتصال حساب ارسال خواهد شد.";
+
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                string payload =
+                    $"{signalSide.ToLowerInvariant()}|{symbol}|{price.ToString(inv)}|" +
+                    $"{plan.StopLoss.ToString(inv)}|{plan.TakeProfit.ToString(inv)}|{leverage}|{mode}";
+                string id = StorePayload(payload);
+                var keyboard = new InlineKeyboardMarkup(new[]
+                {
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("🟢 خرید Spot با USDT", $"ui|sigtrade|{id}|buy"),
+                        InlineKeyboardButton.WithCallbackData("🔴 فروش Spot", $"ui|sigtrade|{id}|sell")
+                    },
+                    new[]
+                    {
+                        InlineKeyboardButton.WithCallbackData("📝 ثبت در دفتر معاملات", $"note_{id}"),
+                        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
+                    }
+                });
+                results.Add((text, keyboard));
             }
-            else
-            {
-                stopLoss = (resistance > 0 && resistance > price) ? resistance * 1.005m : price * 1.015m;
-                takeProfit = (support > 0 && support < price)
-                    ? Math.Max(support * 1.003m, price * 0.975m)
-                    : price * 0.975m;
-            }
-
-            decimal risk = side == "LONG" ? (price - stopLoss) : (stopLoss - price);
-            decimal reward = side == "LONG" ? (takeProfit - price) : (price - takeProfit);
-
-            if (risk <= 0 || reward / risk < 1.2m) return null;
-            if (risk / price > 0.04m) return null;
-
-            decimal riskPercent = risk / price * 100;
-            decimal rewardPercent = reward / price * 100;
-            int leverage = SuggestLeverage(riskPercent);
-
-            Console.WriteLine($"{symbol,-12} | {price,12:N4} | {side} | B:{buyScore} S:{sellScore} | lev {leverage}x");
-            SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, side);
-            TrackSignal(symbol, price, stopLoss, takeProfit);
-
-            string emoji = side == "LONG" ? "🟢" : "🔴";
-            string text =
-                $"{emoji} {side} {symbol}\n" +
-                $"Entry: {price:N4} (Nobitex)\n" +
-                $"Support: {support:N4} | Resistance: {resistance:N4}\n" +
-                $"Stop Loss: {stopLoss:N4} ({(side == "LONG" ? "-" : "+")}{riskPercent:N2}%)\n" +
-                $"Take Profit: {takeProfit:N4} ({(side == "LONG" ? "+" : "-")}{rewardPercent:N2}%)\n" +
-                $"R/R: 1:{(reward / risk):N2}\n" +
-                $"اهرم پیشنهادی: {leverage}x\n" +
-                $"بازار: تعهدی نوبیتکس (LONG/SHORT)\n" +
-                $"Score B/S: {buyScore}/{sellScore}\n" +
-                $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
-                $"AI/News: {aiScore} ({aiReason})\n\n" +
-                $"اگر می‌خوای وارد شی، دکمه را بزن:";
-
-            var inv = System.Globalization.CultureInfo.InvariantCulture;
-            string fullPayload =
-                $"{side.ToLowerInvariant()}|{symbol}|{price.ToString(inv)}|{stopLoss.ToString(inv)}|{takeProfit.ToString(inv)}|{leverage}";
-
-            // callback_data کوتاه تا BUTTON_DATA_INVALID نشود
-            string id = StorePayload(fullPayload);
-
-        //    var keyboard = new InlineKeyboardMarkup(new[]
-        //    {
-        //    new[]
-        //    {
-        //        InlineKeyboardButton.WithCallbackData(
-        //            side == "LONG" ? "⚡ تعهدی LONG" : "⚡ تعهدی SHORT",
-        //            $"exec_{id}"),
-        //        InlineKeyboardButton.WithCallbackData("📝 فقط یادداشت", $"note_{id}")
-        //    },
-        //    new[]
-        //    {
-        //        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
-        //    }
-        //});
-
-            var keyboard = new InlineKeyboardMarkup(new[]
-{
-    new[]
-    {
-        InlineKeyboardButton.WithCallbackData("📝 دیدم", $"note_{id}"),
-        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
-    }
-});
-
-            return (text, keyboard);
         }
         catch (Exception ex)
         {
@@ -1302,11 +1990,9 @@ WHERE Symbol=$s AND Status='Pending'";
 
     static int SuggestLeverage(decimal riskPercent)
     {
-        // riskPercent = فاصله تا SL به درصد
-        if (riskPercent >= 3.0m) return 1;
-        if (riskPercent >= 2.0m) return 2;
-        if (riskPercent >= 1.0m) return 3;
-        return 2; // SL خیلی تنگ → اهرم بالا نده
+        // Until account-aware position sizing and liquidation checks exist,
+        // never suggest leverage above 1x based only on chart stop distance.
+        return 1;
     }
 
 
@@ -1465,40 +2151,50 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         return headlines.Distinct().Take(8).ToList();
     }
 
-    static async Task<string?> AnalyzeSellForOpenTrade(BinanceRestClient client, string symbol)
+    static async Task<string?> AnalyzeSellForOpenTrade(OpenTradeRow trade)
     {
-        var data15m = await GetQuotes(client, symbol, KlineInterval.FifteenMinutes, 100);
-        await Task.Delay(150);
-        var data1h = await GetQuotes(client, symbol, KlineInterval.OneHour, 100);
-        if (data15m == null || data1h == null || data15m.Count < 50) return null;
+        if (!string.Equals(trade.ExchangeCode, "NOBITEX", StringComparison.OrdinalIgnoreCase))
+            return null; // Other adapters are introduced in the multi-exchange phase.
 
-        var ticker = await client.SpotApi.ExchangeData.GetTickerAsync(symbol);
-        if (!ticker.Success) return null;
-        decimal price = ticker.Data.LastPrice;
+        string symbol = trade.Symbol;
+        var data15m = await GetNobitexQuotesAsync(symbol, "15", 100);
+        await Task.Delay(150);
+        var data1h = await GetNobitexQuotesAsync(symbol, "60", 100);
+        if (data15m == null || data1h == null || data15m.Count < 50 || data1h.Count < 50)
+            return null;
+
+        var live = await GetNobitexLastPriceAsync(symbol);
+        if (live is null || live <= 0) return null;
+        decimal price = live.Value;
 
         var a15 = AnalyzeTimeframe(data15m);
         var a1h = AnalyzeTimeframe(data1h);
+        if (!a15.IsValid || !a1h.IsValid) return null;
 
         int buyScore = a15.BuyScore + a1h.BuyScore;
         int sellScore = a15.SellScore + a1h.SellScore;
 
         bool bothBearish = a15.SellScore > a15.BuyScore && a1h.SellScore > a1h.BuyScore;
+        bool bothBullish = a15.BuyScore > a15.SellScore && a1h.BuyScore > a1h.SellScore;
         if (bothBearish) sellScore += 2;
+        if (bothBullish) buyScore += 2;
 
-        // خبر/AI اختیاری (اگر اضافه کرده‌ای)
-        // var (aiScore, aiReason, _) = await GetNewsAiScoreAsync(symbol, buyScore, sellScore);
-        // if (aiScore < 0) sellScore += (-aiScore);
+        bool shouldExit = trade.TradeMode == "SPOT"
+            ? bothBearish && sellScore >= 7 && sellScore >= buyScore + 3 && a15.Rsi > 40 && a1h.Rsi > 35
+            : trade.Side == "SHORT"
+                ? bothBullish && buyScore >= 7 && buyScore >= sellScore + 3 && a15.Rsi < 60 && a1h.Rsi < 65
+                : bothBearish && sellScore >= 7 && sellScore >= buyScore + 3 && a15.Rsi > 40 && a1h.Rsi > 35;
 
-        if (!(bothBearish && sellScore >= 7 && sellScore >= buyScore + 3 &&
-              a15.Rsi > 40 && a1h.Rsi > 35))
+        if (!shouldExit)
             return null;
 
-        return $"🔴 SELL (معامله باز شما)\n" +
+        string action = trade.TradeMode == "SPOT" ? "SELL" : trade.Side == "SHORT" ? "COVER SHORT" : "CLOSE LONG";
+        return $"🔴 {action} (معامله باز شما)\n" +
                $"{symbol}\n" +
                $"Price: {price:N4}\n" +
                $"Score B/S: {buyScore}/{sellScore}\n" +
                $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n\n" +
-               $"اگر فروختی دکمه زیر را بزن:";
+               $"پس از انجام دستی معامله در صرافی، دکمه ثبت خروج را بزن.";
     }
 
     static int GetKeywordNewsScore(List<string> headlines)
@@ -1529,66 +2225,144 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static void InitializeDatabase()
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
-        conn.Open();
-
-        var cmd = conn.CreateCommand();
-        cmd.CommandText = @"
-
-        CREATE TABLE IF NOT EXISTS SignalTracks (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Symbol TEXT NOT NULL,
-            EntryPrice REAL NOT NULL,
-            StopLoss REAL NOT NULL,
-            TakeProfit REAL NOT NULL,
-            Status TEXT DEFAULT 'Pending',
-            SignalAt TEXT DEFAULT CURRENT_TIMESTAMP,
-            ResolvedAt TEXT,
-            ResolvePrice REAL
-        );
-
-        CREATE TABLE IF NOT EXISTS Users (
-            ChatId INTEGER PRIMARY KEY,
-            Username TEXT,
-            FirstName TEXT,
-            IsActive INTEGER DEFAULT 1,
-            CreatedAt TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS AnalysisResults (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            Symbol TEXT,
-            Timeframe TEXT DEFAULT '15m+1h',
-            Price REAL,
-            RSI REAL,
-            BuyScore INTEGER,
-            SellScore INTEGER,
-            Decision TEXT,
-            CreatedAt TEXT DEFAULT CURRENT_TIMESTAMP
-        );
-
-        CREATE TABLE IF NOT EXISTS OpenTrades (
-            Id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ChatId INTEGER NOT NULL,
-            Symbol TEXT NOT NULL,
-            EntryPrice REAL NOT NULL,
-            StopLoss REAL NOT NULL,
-            TakeProfit REAL NOT NULL,
-            Status TEXT DEFAULT 'Open',
-            ExitPrice REAL,
-            ExitReason TEXT,
-            OpenedAt TEXT DEFAULT CURRENT_TIMESTAMP,
-            ClosedAt TEXT
-        );";
-
-        cmd.ExecuteNonQuery();
-
+        DatabaseInitializer.Initialize(DatabaseConnectionString);
         Console.WriteLine("Multi-user database ready.");
+    }
+
+    static void ProvisionExchangeAccountInteractive()
+    {
+        Console.WriteLine("ثبت امن حساب صرافی؛ اطلاعات محرمانه را در تلگرام ارسال نکنید.");
+        Console.Write("Telegram ChatId (کاربر باید قبلاً /start زده باشد): ");
+        if (!long.TryParse(Console.ReadLine(), out long chatId) || chatId <= 0)
+            throw new InvalidOperationException("ChatId نامعتبر است.");
+        Console.Write("Exchange code (مثلاً NOBITEX): ");
+        string exchange = Console.ReadLine()?.Trim() ?? "";
+        if (!exchange.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase) &&
+            !exchange.Equals("BINANCE_TESTNET", StringComparison.OrdinalIgnoreCase))
+            throw new InvalidOperationException("در این مرحله فقط NOBITEX و BINANCE_TESTNET پشتیبانی می‌شوند.");
+        Console.Write("Account label: ");
+        string label = Console.ReadLine()?.Trim() ?? "";
+        Console.WriteLine("برای امنیت، فقط مجوزهای لازم را فعال کنید و مجوز برداشت وجه ندهید.");
+        bool isNobitex = exchange.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase);
+        bool isBinanceTestnet = exchange.Equals("BINANCE_TESTNET", StringComparison.OrdinalIgnoreCase);
+        if (isBinanceTestnet)
+            Console.WriteLine("کلیدها باید از محیط آزمایشی Spot ساخته شوند: https://testnet.binance.vision (نه حساب اصلی Binance).");
+        string apiKey = ReadConsoleSecret(isNobitex
+            ? "Nobitex API Key (کلید عمومی): "
+            : isBinanceTestnet ? "Binance Spot Testnet API Key: " : "API Key: ");
+        string apiSecret = ReadConsoleSecret(isNobitex
+            ? "Nobitex API Private Key / Secret (کلید خصوصی امضای Ed25519): "
+            : "API Secret: ");
+        string passphrase = isNobitex || isBinanceTestnet ? "" : ReadConsoleSecret("Passphrase (در صورت نیاز): ");
+        long id = new UserExchangeAccountRepository(DatabaseConnectionString)
+            .Add(chatId, exchange, label, apiKey, string.IsNullOrEmpty(apiSecret) ? null : apiSecret,
+                string.IsNullOrEmpty(passphrase) ? null : passphrase);
+        Console.WriteLine($"حساب ذخیره شد. AccountId={id}. مقادیر محرمانه نمایش داده نمی‌شوند.");
+        Console.WriteLine("اعتبارسنجی اتصال و معامله واقعی در این نسخه فعال نیست.");
+    }
+
+    static string ReadConsoleSecret(string prompt)
+    {
+        Console.Write(prompt);
+        var value = new StringBuilder();
+        while (true)
+        {
+            var key = Console.ReadKey(intercept: true);
+            if (key.Key == ConsoleKey.Enter) break;
+            if (key.Key == ConsoleKey.Backspace) { if (value.Length > 0) value.Length--; continue; }
+            if (!char.IsControl(key.KeyChar)) value.Append(key.KeyChar);
+        }
+        Console.WriteLine();
+        return value.ToString();
+    }
+
+    static (string Text, InlineKeyboardMarkup? Keyboard) CreateManualOrderPreview(long chatId, string commandText)
+    {
+        const string usage = "برای ساخت پیش‌نمایش سفارش، از منوی «معاملات» گزینه «ثبت سفارش دستی» را انتخاب کنید و مراحل را دنبال کنید.";
+        var parts = commandText.Split(' ', StringSplitOptions.RemoveEmptyEntries);
+        if (parts.Length < 7 || parts.Length > 10) return (usage, null);
+        if (!long.TryParse(parts[1], out long accountId) || accountId <= 0 ||
+            !decimal.TryParse(parts[6], System.Globalization.NumberStyles.Number,
+                System.Globalization.CultureInfo.InvariantCulture, out decimal quantity) || quantity <= 0)
+            return (usage, null);
+
+        if (!Enum.TryParse<ExchangeTradeMode>(parts[3], true, out var mode) || !Enum.IsDefined(mode)) return (usage, null);
+        string sideText = parts[4].ToUpperInvariant();
+        ExchangeOrderSide side;
+        if (mode == ExchangeTradeMode.Spot && sideText is "BUY" or "SELL")
+            side = sideText == "BUY" ? ExchangeOrderSide.Buy : ExchangeOrderSide.Sell;
+        else if (mode != ExchangeTradeMode.Spot && sideText is "LONG" or "SHORT")
+            side = sideText == "LONG" ? ExchangeOrderSide.Buy : ExchangeOrderSide.Sell;
+        else return ("برای Spot از buy/sell و برای Margin/Futures از long/short استفاده کن.\n" + usage, null);
+
+        if (!Enum.TryParse<ExchangeOrderType>(parts[5], true, out var orderType) || !Enum.IsDefined(orderType)) return (usage, null);
+        int next = 7;
+        decimal? limitPrice = null;
+        decimal? priceGuard = null;
+        if (orderType == ExchangeOrderType.Limit)
+        {
+            if (parts.Length <= next || !decimal.TryParse(parts[next], System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsedPrice) || parsedPrice <= 0)
+                return ("برای سفارش Limit قیمت مثبت الزامی است.\n" + usage, null);
+            limitPrice = parsedPrice;
+            next++;
+        }
+        else if (mode == ExchangeTradeMode.Spot)
+        {
+            if (parts.Length <= next || !decimal.TryParse(parts[next], System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsedGuard) || parsedGuard <= 0)
+                return ("برای Market اسپات، PriceGuard مثبت الزامی است.\n" + usage, null);
+            priceGuard = parsedGuard;
+            next++;
+        }
+        decimal? stopLoss = null;
+        decimal? takeProfit = null;
+        if (mode != ExchangeTradeMode.Spot)
+        {
+            if (orderType != ExchangeOrderType.Limit || parts.Length != next + 2 ||
+                !decimal.TryParse(parts[next], System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsedSl) ||
+                !decimal.TryParse(parts[next + 1], System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var parsedTp))
+                return ("برای Margin/Futures سفارش Limit همراه StopLoss و TakeProfit الزامی است.\n" + usage, null);
+            stopLoss = parsedSl;
+            takeProfit = parsedTp;
+            next += 2;
+        }
+        if (parts.Length != next) return (usage, null);
+
+        var account = new UserExchangeAccountRepository(DatabaseConnectionString).List(chatId)
+            .FirstOrDefault(x => x.Id == accountId && x.IsActive);
+        if (account is null) return ("حساب فعال متعلق به شما پیدا نشد. از منوی «حساب‌ها و صرافی‌ها» حساب را انتخاب کنید.", null);
+
+        try
+        {
+            string approvalId = new ManualOrderApprovalRepository(DatabaseConnectionString).Create(
+                new ManualOrderDraft(chatId, accountId, account.ExchangeCode, parts[2], mode, side,
+                    orderType, quantity, limitPrice, stopLoss, takeProfit, PriceGuard: priceGuard));
+            string displaySide = mode == ExchangeTradeMode.Spot ? side.ToString().ToUpperInvariant() : sideText;
+            string preview = $"⚠️ پیش‌نمایش سفارش (اعتبار ۵ دقیقه)\n" +
+                $"صرافی: {account.ExchangeCode} | حساب: #{account.Id} {account.AccountLabel}\n" +
+                $"نماد: {parts[2].ToUpperInvariant()}\nحالت: {mode}\nجهت: {displaySide}\n" +
+                $"نوع: {orderType}\nمقدار: {quantity}\n" +
+                (limitPrice is null ? "" : $"قیمت Limit: {limitPrice.Value}\n") +
+                (priceGuard is null ? "" : $"Price Guard: {priceGuard.Value}\n") +
+                (stopLoss is decimal slValue && takeProfit is decimal tpValue
+                    ? $"StopLoss: {slValue} | TakeProfit: {tpValue}\n" : "") +
+                "\nتأیید فقط درخواست را برای اجرای دستی علامت‌گذاری می‌کند؛ هیچ سفارشی ارسال نمی‌شود.";
+            var keyboard = new InlineKeyboardMarkup(new[]
+            {
+                new[] { InlineKeyboardButton.WithCallbackData("✅ تأیید برای اجرای دستی", $"approve_order|{approvalId}"),
+                        InlineKeyboardButton.WithCallbackData("❌ رد", $"reject_order|{approvalId}") }
+            });
+            return (preview, keyboard);
+        }
+        catch (Exception ex) { return ($"ساخت پیش‌نمایش ناموفق بود: {ex.Message}", null); }
     }
 
     static void RegisterUser(long chatId, string? username, string? firstName)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
@@ -1622,7 +2396,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static void SetUserActive(long chatId, bool active)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = "UPDATE Users SET IsActive=$a WHERE ChatId=$id";
@@ -1634,7 +2408,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
     static List<long> GetActiveChatIds()
     {
         var list = new List<long>();
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = "SELECT ChatId FROM Users WHERE IsActive=1";
@@ -1646,7 +2420,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static void SaveAnalysis(string symbol, decimal price, double rsi, int buy, int sell, string decision)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
@@ -1661,26 +2435,32 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         cmd.ExecuteNonQuery();
     }
 
-    static bool HasOpenTrade(long chatId, string symbol)
+    static bool HasOpenTrade(long chatId, string symbol, string? tradeMode = null)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
-        cmd.CommandText = "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND Status='Open'";
+        cmd.CommandText = tradeMode is null
+            ? "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND Status='Open'"
+            : "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND TradeMode=$m AND Status='Open'";
         cmd.Parameters.AddWithValue("$c", chatId);
         cmd.Parameters.AddWithValue("$s", symbol);
+        if (tradeMode is not null) cmd.Parameters.AddWithValue("$m", tradeMode);
         return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
     }
 
     static void OpenTrade(long chatId, string symbol, decimal entry, decimal sl, decimal tp,
-    string side = "LONG", int leverage = 1)
+        string side = "LONG", int leverage = 1, string tradeMode = "MARGIN",
+        string exchangeCode = "NOBITEX", long? exchangeAccountId = null)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-        INSERT INTO OpenTrades (ChatId, Symbol, EntryPrice, StopLoss, TakeProfit, Status, Side, Leverage)
-        VALUES ($c, $s, $e, $sl, $tp, 'Open', $side, $lev)";
+        INSERT INTO OpenTrades
+            (ChatId, Symbol, EntryPrice, StopLoss, TakeProfit, Status, Side, Leverage,
+             TradeMode, ExchangeCode, ExchangeAccountId)
+        VALUES ($c, $s, $e, $sl, $tp, 'Open', $side, $lev, $mode, $exchange, $account)";
         cmd.Parameters.AddWithValue("$c", chatId);
         cmd.Parameters.AddWithValue("$s", symbol);
         cmd.Parameters.AddWithValue("$e", entry);
@@ -1688,25 +2468,34 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         cmd.Parameters.AddWithValue("$tp", tp);
         cmd.Parameters.AddWithValue("$side", side);
         cmd.Parameters.AddWithValue("$lev", leverage);
+        cmd.Parameters.AddWithValue("$mode", tradeMode);
+        cmd.Parameters.AddWithValue("$exchange", exchangeCode);
+        cmd.Parameters.AddWithValue("$account", exchangeAccountId is null ? DBNull.Value : exchangeAccountId.Value);
         cmd.ExecuteNonQuery();
     }
 
     static List<OpenTradeRow> GetOpenTrades(long? chatId = null)
     {
         var list = new List<OpenTradeRow>();
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
 
         if (chatId.HasValue)
         {
-            cmd.CommandText = @"SELECT Id, ChatId, Symbol, EntryPrice, StopLoss, TakeProfit
+            cmd.CommandText = @"SELECT Id, ChatId, Symbol, EntryPrice, StopLoss, TakeProfit,
+                                       IFNULL(Side,'LONG'), IFNULL(Leverage,1),
+                                       IFNULL(TradeMode,'MARGIN'), IFNULL(ExchangeCode,'NOBITEX'), ExchangeAccountId, ExitReason,
+                                       IFNULL(Quantity,'0'), IFNULL(OcoStatus,'NotSubmitted')
                             FROM OpenTrades WHERE Status='Open' AND ChatId=$c";
             cmd.Parameters.AddWithValue("$c", chatId.Value);
         }
         else
         {
-            cmd.CommandText = @"SELECT Id, ChatId, Symbol, EntryPrice, StopLoss, TakeProfit
+            cmd.CommandText = @"SELECT Id, ChatId, Symbol, EntryPrice, StopLoss, TakeProfit,
+                                       IFNULL(Side,'LONG'), IFNULL(Leverage,1),
+                                       IFNULL(TradeMode,'MARGIN'), IFNULL(ExchangeCode,'NOBITEX'), ExchangeAccountId, ExitReason,
+                                       IFNULL(Quantity,'0'), IFNULL(OcoStatus,'NotSubmitted')
                             FROM OpenTrades WHERE Status='Open'";
         }
 
@@ -1720,7 +2509,16 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
                 Symbol = reader.GetString(2),
                 EntryPrice = reader.GetDecimal(3),
                 StopLoss = reader.GetDecimal(4),
-                TakeProfit = reader.GetDecimal(5)
+                TakeProfit = reader.GetDecimal(5),
+                Side = reader.GetString(6),
+                Leverage = Convert.ToInt32(reader.GetValue(7)),
+                TradeMode = reader.GetString(8),
+                ExchangeCode = reader.GetString(9),
+                ExchangeAccountId = reader.IsDBNull(10) ? null : reader.GetInt64(10),
+                ExitReason = reader.IsDBNull(11) ? null : reader.GetString(11),
+                Quantity = decimal.TryParse(reader.GetString(12), System.Globalization.NumberStyles.Number,
+                    System.Globalization.CultureInfo.InvariantCulture, out var quantity) ? quantity : 0m,
+                OcoStatus = reader.GetString(13)
             });
         }
         return list;
@@ -1728,7 +2526,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static void CloseTrade(int id, decimal exitPrice, string reason)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
@@ -1741,36 +2539,18 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         cmd.ExecuteNonQuery();
     }
 
-    static string GetPerformanceStats(long chatId)
+    static void MarkExitSuggested(int id, string trigger)
     {
-        using var conn = new SqliteConnection("Data Source=crypto_analyzer.db");
+        using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-        SELECT ExitReason, COUNT(1),
-               AVG((ExitPrice - EntryPrice) / EntryPrice * 100)
-        FROM OpenTrades
-        WHERE Status='Closed' AND ChatId=$c
-        GROUP BY ExitReason";
-        cmd.Parameters.AddWithValue("$c", chatId);
-
-        var lines = new List<string> { "📊 آمار شما:" };
-        int total = 0, wins = 0;
-
-        using var reader = cmd.ExecuteReader();
-        while (reader.Read())
-        {
-            string reason = reader.GetString(0);
-            int cnt = reader.GetInt32(1);
-            double avg = reader.IsDBNull(2) ? 0 : reader.GetDouble(2);
-            total += cnt;
-            if (reason == "TakeProfit") wins += cnt;
-            lines.Add($"  {reason}: {cnt} | میانگین: {avg:N2}%");
-        }
-
-        if (total == 0) return "📊 هنوز معامله بسته‌شده‌ای ندارید.";
-        lines.Add($"  Win Rate: {(double)wins / total * 100:N1}% از {total} معامله");
-        return string.Join("\n", lines);
+UPDATE OpenTrades
+SET ExitReason=$reason
+WHERE Id=$id AND Status='Open' AND (ExitReason IS NULL OR ExitReason NOT LIKE 'ExitSuggested:%');";
+        cmd.Parameters.AddWithValue("$reason", $"ExitSuggested:{trigger}");
+        cmd.Parameters.AddWithValue("$id", id);
+        cmd.ExecuteNonQuery();
     }
 
     static async Task CheckOpenTrades(BinanceRestClient client, TelegramBotClient bot)
@@ -1781,6 +2561,9 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         {
             try
             {
+                if (!string.Equals(t.ExchangeCode, "NOBITEX", StringComparison.OrdinalIgnoreCase))
+                    continue; // Never price a non-Nobitex position with Nobitex quotes.
+
                 // قیمت از نوبیتکس (هم‌خوان با ورود)
                 decimal? live = await GetNobitexLastPriceAsync(t.Symbol);
                 await Task.Delay(150);
@@ -1809,33 +2592,30 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
                     hitTp = price >= t.TakeProfit;
                 }
 
-                if (hitSl)
+                if (hitSl || hitTp)
                 {
-                    CloseTrade(t.Id, price, "StopLoss");
+                    if (t.ExitReason?.StartsWith("ExitSuggested:", StringComparison.Ordinal) == true)
+                        continue;
+
+                    string trigger = hitSl ? "STOP LOSS" : "TAKE PROFIT";
+                    MarkExitSuggested(t.Id, trigger);
+                    var keyboard = new InlineKeyboardMarkup(new[]
+                    {
+                        new[]
+                        {
+                            InlineKeyboardButton.WithCallbackData(
+                                "✅ بعد از خروج دستی ثبت کن", $"sold|{t.Id}")
+                        }
+                    });
 
                     await bot.SendMessage(t.ChatId,
-                        $"🛑 STOP LOSS\n" +
-                        $"{side} {t.Symbol}\n" +
-                        $"Entry: {t.EntryPrice:N4}\n" +
-                        $"Exit: {price:N4}\n" +
-                        $"PnL: {pnlPercent:N2}%\n" +
-                        $"Leverage: {t.Leverage}x");
-
-                    Console.WriteLine($"SL: {side} {t.Symbol} chat={t.ChatId} pnl={pnlPercent:N2}%");
-                }
-                else if (hitTp)
-                {
-                    CloseTrade(t.Id, price, "TakeProfit");
-
-                    await bot.SendMessage(t.ChatId,
-                        $"🎯 TAKE PROFIT\n" +
-                        $"{side} {t.Symbol}\n" +
-                        $"Entry: {t.EntryPrice:N4}\n" +
-                        $"Exit: {price:N4}\n" +
-                        $"PnL: {pnlPercent:N2}%\n" +
-                        $"Leverage: {t.Leverage}x");
-
-                    Console.WriteLine($"TP: {side} {t.Symbol} chat={t.ChatId} pnl={pnlPercent:N2}%");
+                        $"{(hitSl ? "🛑" : "🎯")} {trigger} لمس شد\n" +
+                        $"{t.TradeMode} {side} {t.Symbol}\n" +
+                        $"Entry: {t.EntryPrice:N4}\nNow: {price:N4}\n" +
+                        $"PnL: {pnlPercent:N2}%\n\n" +
+                        "پوزیشن هنوز در دفتر باز است. ابتدا در صرافی به‌صورت دستی خارج شو؛ سپس ثبت خروج را بزن.",
+                        replyMarkup: keyboard);
+                    continue;
                 }
                 else
                 {
@@ -1855,7 +2635,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
                         {
                         new[]
                         {
-                            InlineKeyboardButton.WithCallbackData("✅ بستم", $"sold|{t.Symbol}")
+                            InlineKeyboardButton.WithCallbackData("✅ خروج دستی را ثبت کن", $"sold|{t.Id}")
                         }
                     });
 
@@ -1950,7 +2730,13 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
                 });
             }
 
-            return quotes.OrderBy(q => q.Date).ToList();
+            // UDF timestamps identify candle-open time. Never feed the still-forming
+            // 15m/1h candle into indicators; otherwise historical signals repaint.
+            DateTime utcNow = DateTime.UtcNow;
+            return quotes
+                .Where(q => StrategyRules.IsCandleClosed(q.Date, TimeSpan.FromMinutes(minutes), utcNow))
+                .OrderBy(q => q.Date)
+                .ToList();
         }
         catch (Exception ex)
         {
@@ -1998,16 +2784,26 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static TfResult AnalyzeTimeframe(List<Skender.Stock.Indicators.Quote> quotes)
     {
+        if (quotes.Count < 50)
+            return new TfResult { IsValid = false };
+
         var rsiList = quotes.GetRsi(14).ToList();
         var macdList = quotes.GetMacd(12, 26, 9).ToList();
         var sma20 = quotes.GetSma(20).LastOrDefault()?.Sma;
         var sma50 = quotes.GetSma(50).LastOrDefault()?.Sma;
         var last = quotes.Last().Close;
 
-        double rsi = rsiList.LastOrDefault()?.Rsi ?? 50;
+        var rsiValue = rsiList.LastOrDefault()?.Rsi;
         var macd = macdList.LastOrDefault();
-        double macdVal = macd?.Macd ?? 0;
-        double signal = macd?.Signal ?? 0;
+        if (rsiValue is null || macd?.Macd is null || macd.Signal is null ||
+            sma20 is null || sma50 is null || last <= 0)
+            return new TfResult { IsValid = false };
+
+        double rsi = rsiValue.Value;
+        double macdVal = macd.Macd.Value;
+        double signal = macd.Signal.Value;
+        if (!double.IsFinite(rsi) || !double.IsFinite(macdVal) || !double.IsFinite(signal))
+            return new TfResult { IsValid = false };
 
         int buy = 0, sell = 0;
 
@@ -2024,7 +2820,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         if (sma20 is not null && last < (decimal)sma20) sell += 1;
         if (sma50 is not null && last < (decimal)sma50) sell += 1;
 
-        return new TfResult { Rsi = rsi, BuyScore = buy, SellScore = sell };
+        return new TfResult { IsValid = true, Rsi = rsi, BuyScore = buy, SellScore = sell };
     }
 
     static (decimal Support, decimal Resistance) FindSupportResistance(List<Quote> quotes)
@@ -2117,6 +2913,270 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
             .OrderBy(x => x)];
     }
 
+    static decimal CalcPnlPercent(string side, decimal entry, decimal exit)
+    {
+        if (entry <= 0) return 0;
+        side = string.IsNullOrWhiteSpace(side) ? "LONG" : side.ToUpperInvariant();
+        return side == "SHORT"
+            ? (entry - exit) / entry * 100m
+            : (exit - entry) / entry * 100m;
+    }
+
+    // ==================== GetPendingSignals ====================
+    static List<SignalTrack> GetPendingSignals()
+    {
+        var list = new List<SignalTrack>();
+        try
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT Id,
+       Symbol,
+       IFNULL(Side, 'LONG'),
+       IFNULL(TradeMode, 'MARGIN'),
+       EntryPrice,
+       StopLoss,
+       TakeProfit,
+       Status,
+       SignalAt,
+       ResolvePrice
+FROM SignalTracks
+WHERE Status = 'Pending';";
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                list.Add(new SignalTrack
+                {
+                    Id = r.GetInt64(0),
+                    Symbol = r.GetString(1),
+                    Side = r.IsDBNull(2) ? "LONG" : r.GetString(2),
+                    TradeMode = r.GetString(3),
+                    Entry = r.GetDecimal(4),
+                    StopLoss = r.GetDecimal(5),
+                    TakeProfit = r.GetDecimal(6),
+                    Status = r.GetString(7),
+                    SignalAt = DateTime.Parse(r.GetString(8), null,
+                        System.Globalization.DateTimeStyles.RoundtripKind),
+                    ExitPrice = r.IsDBNull(9) ? null : r.GetDecimal(9)
+                });
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"GetPendingSignals: {ex.Message}");
+        }
+        return list;
+    }
+
+    // ==================== UpdateSignal ====================
+    static void UpdateSignal(long id, string status, decimal exitPrice)
+    {
+        try
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+UPDATE SignalTracks
+SET Status = $st,
+    ResolvePrice = $ex,
+    ResolvedAt = $rt
+WHERE Id = $id;";
+            cmd.Parameters.AddWithValue("$st", status);
+            cmd.Parameters.AddWithValue("$ex", exitPrice);
+            cmd.Parameters.AddWithValue("$rt", DateTime.UtcNow.ToString("o"));
+            cmd.Parameters.AddWithValue("$id", id);
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"UpdateSignal: {ex.Message}");
+        }
+    }
+
+    // ==================== ResolvePendingSignals ====================
+    static async Task ResolvePendingSignals()
+    {
+        var pending = GetPendingSignals();
+
+        foreach (var s in pending)
+        {
+            try
+            {
+                var live = await GetNobitexLastPriceAsync(s.Symbol);
+                if (live is null || live <= 0) continue;
+                decimal price = live.Value;
+                string side = string.IsNullOrWhiteSpace(s.Side) ? "LONG" : s.Side.ToUpperInvariant();
+
+                bool isShort = side == "SHORT";
+                bool hitSl = isShort
+                    ? StrategyRules.IsShortStopLossHit(price, s.StopLoss)
+                    : StrategyRules.IsLongStopLossHit(price, s.StopLoss);
+                bool hitTp = isShort
+                    ? StrategyRules.IsShortTakeProfitHit(price, s.TakeProfit)
+                    : StrategyRules.IsLongTakeProfitHit(price, s.TakeProfit);
+
+                // If both thresholds were crossed between polls, intrabar order is
+                // unknowable from a ticker snapshot; classify conservatively as SL.
+                if (hitSl)
+                {
+                    UpdateSignal(s.Id, "HitSL", price);
+                    Console.WriteLine($"Signal HitSL: {side} {s.Symbol} @ {price:N4}");
+                }
+                else if (hitTp)
+                {
+                    UpdateSignal(s.Id, "HitTP", price);
+                    Console.WriteLine($"Signal HitTP: {side} {s.Symbol} @ {price:N4}");
+                }
+                else if (DateTime.UtcNow - s.SignalAt.ToUniversalTime() > TimeSpan.FromHours(24))
+                {
+                    UpdateSignal(s.Id, "Expired", price);
+                    Console.WriteLine($"Signal Expired: {side} {s.Symbol} @ {price:N4}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Resolve signal {s.Symbol}: {ex.Message}");
+            }
+        }
+    }
+
+    // ==================== GetSignalReport ====================
+    static string GetSignalReport()
+    {
+        try
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+
+            int total = 0, hitTp = 0, hitSl = 0, pending = 0, expired = 0;
+            var pnls = new List<decimal>();
+            var lines = new List<string>();
+
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT Id, Symbol, IFNULL(Side,'LONG'), EntryPrice, StopLoss, TakeProfit,
+       Status, SignalAt, ResolvePrice
+FROM SignalTracks
+ORDER BY Id DESC
+LIMIT 200;";
+
+            using (var r = cmd.ExecuteReader())
+            {
+                while (r.Read())
+                {
+                    total++;
+                    string symbol = r.GetString(1);
+                    string side = r.IsDBNull(2) ? "LONG" : r.GetString(2);
+                    decimal entry = r.GetDecimal(3);
+                    decimal sl = r.GetDecimal(4);
+                    decimal tp = r.GetDecimal(5);
+                    string status = r.GetString(6);
+                    string at = r.GetString(7);
+                    decimal? exit = r.IsDBNull(8) ? null : r.GetDecimal(8);
+
+                    switch (status)
+                    {
+                        case "HitTP": hitTp++; break;
+                        case "HitSL": hitSl++; break;
+                        case "Pending": pending++; break;
+                        case "Expired": expired++; break;
+                    }
+
+                    if ((status == "HitTP" || status == "HitSL") && exit is not null)
+                        pnls.Add(CalcPnlPercent(side, entry, exit.Value));
+
+                    if (lines.Count < 15)
+                    {
+                        lines.Add(
+                            $"{symbol} | {side} | E:{entry:N4} | TP:{tp:N4} | SL:{sl:N4} | {status} | {at}");
+                    }
+                }
+            }
+
+            int decided = hitTp + hitSl;
+            double winRate = decided > 0 ? (double)hitTp / decided * 100.0 : 0;
+            decimal avgPnl = pnls.Count > 0 ? pnls.Average() : 0;
+
+            return
+                "📊 گزارش سیگنال‌ها\n" +
+                $"کل: {total}\n" +
+                $"✅ HitTP: {hitTp}\n" +
+                $"🛑 HitSL: {hitSl}\n" +
+                $"⏳ Pending: {pending}\n" +
+                $"⌛ Expired: {expired}\n" +
+                $"نرخ موفقیت (TP/تعیین‌تکلیف): {winRate:N1}%\n" +
+                $"میانگین PnL فرضی: {avgPnl:N2}%\n\n" +
+                "آخرین موارد:\n" +
+                string.Join("\n", lines);
+        }
+        catch (Exception ex)
+        {
+            return $"خطا در گزارش: {ex.Message}";
+        }
+    }
+
+    // ==================== GetPerformanceStats (معاملات باز/بسته کاربر) ====================
+    static string GetPerformanceStats(long chatId)
+    {
+        try
+        {
+            using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+            var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+SELECT Symbol, IFNULL(Side,'LONG'), EntryPrice, StopLoss, TakeProfit, Status, ExitPrice, IFNULL(Leverage,1)
+FROM OpenTrades
+WHERE ChatId=$c
+ORDER BY Id DESC
+LIMIT 50;";
+            cmd.Parameters.AddWithValue("$c", chatId);
+
+            int open = 0, closed = 0;
+            var pnls = new List<decimal>();
+            var lines = new List<string>();
+
+            using var r = cmd.ExecuteReader();
+            while (r.Read())
+            {
+                string symbol = r.GetString(0);
+                string side = r.IsDBNull(1) ? "LONG" : r.GetString(1);
+                decimal entry = r.GetDecimal(2);
+                decimal sl = r.GetDecimal(3);
+                decimal tp = r.GetDecimal(4);
+                string status = r.GetString(5);
+                decimal? exit = r.IsDBNull(6) ? null : r.GetDecimal(6);
+                int lev = r.IsDBNull(7) ? 1 : Convert.ToInt32(r.GetValue(7));
+
+                if (status == "Open") open++;
+                else closed++;
+
+                string pnlTxt = "-";
+                if (exit is not null && status != "Open")
+                {
+                    var pnl = CalcPnlPercent(side, entry, exit.Value);
+                    pnls.Add(pnl);
+                    pnlTxt = $"{pnl:N2}%";
+                }
+
+                lines.Add($"{side} {symbol} | E:{entry:N4} | {status} | PnL:{pnlTxt} | lev {lev}x");
+            }
+
+            decimal avg = pnls.Count > 0 ? pnls.Average() : 0;
+            return
+                "📈 آمار معاملات شما\n" +
+                $"باز: {open} | بسته: {closed}\n" +
+                $"میانگین PnL بسته‌شده: {avg:N2}%\n\n" +
+                string.Join("\n", lines.Take(20));
+        }
+        catch (Exception ex)
+        {
+            return $"خطا در آمار: {ex.Message}";
+        }
+    }
+
     class OpenTradeRow
     {
         public int Id { get; set; }
@@ -2127,16 +3187,26 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         public decimal TakeProfit { get; set; }
         public string Side { get; set; } = "LONG";
         public int Leverage { get; set; } = 1;
+        public string TradeMode { get; set; } = "MARGIN";
+        public string ExchangeCode { get; set; } = "NOBITEX";
+        public long? ExchangeAccountId { get; set; }
+        public string? ExitReason { get; set; }
+        public decimal Quantity { get; set; }
+        public string OcoStatus { get; set; } = "NotSubmitted";
     }
 
     class SignalTrack
     {
-        public int Id { get; set; }
+        public long Id { get; set; }
         public string Symbol { get; set; } = "";
-        public decimal EntryPrice { get; set; }
+        public string Side { get; set; } = "LONG";
+        public string TradeMode { get; set; } = "MARGIN";
+        public decimal Entry { get; set; }
         public decimal StopLoss { get; set; }
         public decimal TakeProfit { get; set; }
+        public string Status { get; set; } = "Pending";
         public DateTime SignalAt { get; set; }
+        public decimal? ExitPrice { get; set; }
     }
 
     class NobitexOrderResult
@@ -2162,6 +3232,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     class TfResult
     {
+        public bool IsValid { get; set; }
         public double Rsi { get; set; }
         public int BuyScore { get; set; }
         public int SellScore { get; set; }
