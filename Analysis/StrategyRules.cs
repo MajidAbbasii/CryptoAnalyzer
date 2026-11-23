@@ -17,6 +17,14 @@ public enum TradeSide
 public readonly record struct TradePlan(decimal Entry, decimal StopLoss, decimal TakeProfit,
     decimal RiskPercent, decimal RewardRiskRatio);
 
+public enum SignalOutcome
+{
+    Pending,
+    HitStopLoss,
+    HitTakeProfit,
+    Expired
+}
+
 public static class StrategyRules
 {
     public static bool IsCandleClosed(DateTime candleOpenUtc, TimeSpan interval, DateTime nowUtc)
@@ -39,10 +47,50 @@ public static class StrategyRules
         price > 0 && resistance > price &&
         (resistance - price) / price * 100m <= maxDistancePercent;
 
+    public static bool IsConfirmedLong(bool bothTimeframesBullish, bool nearSupport, bool aboveSma50) =>
+        bothTimeframesBullish && (nearSupport || aboveSma50);
+
+    public static bool IsConfirmedShort(bool bothTimeframesBearish, bool nearResistance, bool belowSma50) =>
+        bothTimeframesBearish && (nearResistance || belowSma50);
+
     public static bool IsLongTakeProfitHit(decimal price, decimal takeProfit) => price >= takeProfit;
     public static bool IsLongStopLossHit(decimal price, decimal stopLoss) => price <= stopLoss;
     public static bool IsShortTakeProfitHit(decimal price, decimal takeProfit) => price <= takeProfit;
     public static bool IsShortStopLossHit(decimal price, decimal stopLoss) => price >= stopLoss;
+
+    public static SignalOutcome EvaluateSignal(string side, decimal price, decimal stopLoss,
+        decimal takeProfit, DateTime signalAt, DateTime now, TimeSpan maxAge)
+    {
+        if (maxAge <= TimeSpan.Zero)
+            throw new ArgumentOutOfRangeException(nameof(maxAge));
+
+        DateTime signalUtc = signalAt.Kind == DateTimeKind.Utc
+            ? signalAt
+            : signalAt.ToUniversalTime();
+        DateTime nowUtc = now.Kind == DateTimeKind.Utc
+            ? now
+            : now.ToUniversalTime();
+
+        // Expiration takes precedence: a stale signal must not become a win/loss
+        // merely because price eventually crossed a threshold after its lifetime.
+        if (nowUtc - signalUtc >= maxAge)
+            return SignalOutcome.Expired;
+
+        if (price <= 0 || stopLoss <= 0 || takeProfit <= 0)
+            return SignalOutcome.Pending;
+
+        bool isShort = string.Equals(side, "SHORT", StringComparison.OrdinalIgnoreCase);
+        bool hitStopLoss = isShort
+            ? IsShortStopLossHit(price, stopLoss)
+            : IsLongStopLossHit(price, stopLoss);
+        if (hitStopLoss)
+            return SignalOutcome.HitStopLoss;
+
+        bool hitTakeProfit = isShort
+            ? IsShortTakeProfitHit(price, takeProfit)
+            : IsLongTakeProfitHit(price, takeProfit);
+        return hitTakeProfit ? SignalOutcome.HitTakeProfit : SignalOutcome.Pending;
+    }
 
     public static decimal CalculatePnlPercent(TradeSide side, decimal entry, decimal exit)
     {

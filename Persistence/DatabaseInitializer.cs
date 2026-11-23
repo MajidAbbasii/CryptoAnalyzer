@@ -26,6 +26,12 @@ public static class DatabaseInitializer
                 IsActive INTEGER NOT NULL DEFAULT 1,
                 CreatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
+            CREATE TABLE IF NOT EXISTS UserSignalPreferences (
+                ChatId INTEGER PRIMARY KEY,
+                Source TEXT NOT NULL DEFAULT 'NOBITEX',
+                UpdatedAt TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (ChatId) REFERENCES Users(ChatId) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS SignalTracks (
                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
                 Symbol TEXT NOT NULL,
@@ -40,9 +46,19 @@ public static class DatabaseInitializer
                 ResolvedAt TEXT,
                 ResolvePrice REAL
             );
+            CREATE TABLE IF NOT EXISTS SignalEvaluationLogs (
+                Id INTEGER PRIMARY KEY AUTOINCREMENT,
+                SignalTrackId INTEGER NOT NULL,
+                CheckedAt TEXT NOT NULL,
+                MarketPrice REAL,
+                Outcome TEXT NOT NULL,
+                Details TEXT,
+                FOREIGN KEY (SignalTrackId) REFERENCES SignalTracks(Id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS AnalysisResults (
                 Id INTEGER PRIMARY KEY AUTOINCREMENT,
                 Symbol TEXT,
+                ExchangeCode TEXT NOT NULL DEFAULT 'NOBITEX',
                 Timeframe TEXT DEFAULT '15m+1h',
                 Price REAL,
                 RSI REAL,
@@ -117,6 +133,8 @@ public static class DatabaseInitializer
                 ON UserExchangeAccounts(ChatId, ExchangeCode, AccountLabel);
             CREATE INDEX IF NOT EXISTS IX_OpenTrades_User_Status ON OpenTrades(ChatId, Status);
             CREATE INDEX IF NOT EXISTS IX_SignalTracks_Status_Symbol ON SignalTracks(Status, Symbol);
+            CREATE INDEX IF NOT EXISTS IX_SignalEvaluationLogs_Signal_CheckedAt
+                ON SignalEvaluationLogs(SignalTrackId, CheckedAt);
             CREATE INDEX IF NOT EXISTS IX_ManualOrderApprovals_User_Status ON ManualOrderApprovals(ChatId, Status);
             """);
 
@@ -124,6 +142,7 @@ public static class DatabaseInitializer
         EnsureColumn(connection, transaction, "SignalTracks", "Side", "TEXT NOT NULL DEFAULT 'LONG'");
         EnsureColumn(connection, transaction, "SignalTracks", "TradeMode", "TEXT NOT NULL DEFAULT 'MARGIN'");
         EnsureColumn(connection, transaction, "SignalTracks", "ExchangeCode", "TEXT NOT NULL DEFAULT 'NOBITEX'");
+        EnsureColumn(connection, transaction, "AnalysisResults", "ExchangeCode", "TEXT NOT NULL DEFAULT 'NOBITEX'");
         EnsureColumn(connection, transaction, "OpenTrades", "Side", "TEXT NOT NULL DEFAULT 'LONG'");
         EnsureColumn(connection, transaction, "OpenTrades", "Leverage", "INTEGER NOT NULL DEFAULT 1");
         EnsureColumn(connection, transaction, "OpenTrades", "TradeMode", "TEXT NOT NULL DEFAULT 'MARGIN'");

@@ -7,6 +7,74 @@ using System.Text;
 using NSec.Cryptography;
 
 var passed = 0;
+Run("Binance public market data parses closed candles and current ticker without credentials", () =>
+{
+    var now = new DateTime(2026, 11, 14, 12, 30, 0, DateTimeKind.Utc);
+    long closedOpen = new DateTimeOffset(now.AddMinutes(-30)).ToUnixTimeMilliseconds();
+    long formingOpen = new DateTimeOffset(now.AddMinutes(-15)).ToUnixTimeMilliseconds();
+    var handler = new FakeHttpMessageHandler(request => request.RequestUri!.AbsolutePath switch
+    {
+        "/api/v3/klines" => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent($"[[{closedOpen},\"100\",\"110\",\"95\",\"105\",\"12\",0],[{formingOpen},\"105\",\"115\",\"100\",\"112\",\"8\",0]]")
+        },
+        "/api/v3/ticker/price" => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+        {
+            Content = new StringContent("{\"symbol\":\"BTCUSDT\",\"price\":\"106.25\"}")
+        },
+        _ => new HttpResponseMessage(System.Net.HttpStatusCode.NotFound)
+    });
+    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://data-api.binance.vision") };
+    var market = new BinancePublicMarketData(http);
+    var candles = market.GetKlinesAsync("BTCUSDT", "15m", 100, now).GetAwaiter().GetResult();
+    Assert(candles is { Count: 1 } && candles[0].Close == 105m,
+        "Binance candles should be parsed and the still-forming candle excluded");
+    Assert(market.GetLastPriceAsync("BTCUSDT").GetAwaiter().GetResult() == 106.25m,
+        "Binance ticker price was not parsed");
+    Assert(handler.Requests.All(x => x.ApiKey is null && x.Authorization is null),
+        "public Binance market-data requests must not require or send credentials");
+    Assert(handler.Requests.All(x => x.Uri!.Host == "data-api.binance.vision"),
+        "public market-data host must be used");
+});
+
+Run("Binance public market data rejects unsupported symbols and intervals before HTTP", () =>
+{
+    var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+    {
+        Content = new StringContent("[]")
+    });
+    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://data-api.binance.vision") };
+    var market = new BinancePublicMarketData(http);
+    Assert(market.GetKlinesAsync("BTCIRT", "15m").GetAwaiter().GetResult() is null,
+        "non-USDT symbols must be rejected");
+    Assert(market.GetKlinesAsync("BTCUSDT", "4h").GetAwaiter().GetResult() is null,
+        "unsupported intervals must be rejected");
+    Assert(market.GetLastPriceAsync("BTC/USDT").GetAwaiter().GetResult() is null,
+        "malformed symbols must be rejected");
+    Assert(handler.Requests.Count == 0, "invalid inputs must not trigger HTTP requests");
+});
+
+Run("Binance top-volume symbols exclude stable and leveraged tokens without false positives", () =>
+{
+    var handler = new FakeHttpMessageHandler(_ => new HttpResponseMessage(System.Net.HttpStatusCode.OK)
+    {
+        Content = new StringContent("""
+            [
+              {"symbol":"BTCUSDT","quoteVolume":"500"},
+              {"symbol":"SUPERUSDT","quoteVolume":"400"},
+              {"symbol":"ETHUPUSDT","quoteVolume":"900"},
+              {"symbol":"USDCUSDT","quoteVolume":"1000"},
+              {"symbol":"ETHUSDT","quoteVolume":"300"}
+            ]
+            """)
+    });
+    using var http = new HttpClient(handler) { BaseAddress = new Uri("https://data-api.binance.vision") };
+    var market = new BinancePublicMarketData(http);
+    var symbols = market.GetTopUsdtSymbolsAsync(10).GetAwaiter().GetResult();
+    Assert(symbols.SequenceEqual(new[] { "BTCUSDT", "SUPERUSDT", "ETHUSDT" }),
+        "top symbols must be volume-ranked, remove stable/leveraged tokens, and keep legitimate SUPERUSDT");
+});
+
 Run("support proximity rejects a crossed level", () =>
 {
     Assert(StrategyRules.IsNearSupport(101m, 100m), "valid support distance should pass");
@@ -18,6 +86,18 @@ Run("resistance proximity rejects a crossed level", () =>
 {
     Assert(StrategyRules.IsNearResistance(99m, 100m), "valid resistance distance should pass");
     Assert(!StrategyRules.IsNearResistance(101m, 100m), "resistance below price must not pass");
+});
+
+Run("support and resistance proximity cannot override multi-timeframe trend", () =>
+{
+    Assert(!StrategyRules.IsConfirmedLong(false, true, false),
+        "near support alone must not authorize a long against mixed/bearish timeframes");
+    Assert(!StrategyRules.IsConfirmedShort(false, true, false),
+        "near resistance alone must not authorize a short against mixed/bullish timeframes");
+    Assert(StrategyRules.IsConfirmedLong(true, true, false), "bullish trend near support should pass");
+    Assert(StrategyRules.IsConfirmedLong(true, false, true), "bullish trend above SMA50 should pass");
+    Assert(StrategyRules.IsConfirmedShort(true, true, false), "bearish trend near resistance should pass");
+    Assert(StrategyRules.IsConfirmedShort(true, false, true), "bearish trend below SMA50 should pass");
 });
 
 Run("only fully closed candles are eligible for indicators", () =>
@@ -34,6 +114,23 @@ Run("long and short stop/target triggers are directional", () =>
     Assert(StrategyRules.IsLongTakeProfitHit(111m, 110m), "long TP trigger incorrect");
     Assert(StrategyRules.IsShortStopLossHit(106m, 105m), "short SL trigger incorrect");
     Assert(StrategyRules.IsShortTakeProfitHit(89m, 90m), "short TP trigger incorrect");
+});
+
+Run("signals expire before late stop-loss or take-profit crossings", () =>
+{
+    var signalAt = new DateTime(2026, 11, 13, 10, 0, 0, DateTimeKind.Utc);
+    var afterExpiry = signalAt.AddHours(24).AddMinutes(1);
+    Assert(StrategyRules.EvaluateSignal("LONG", 90m, 95m, 110m, signalAt, afterExpiry,
+        TimeSpan.FromHours(24)) == SignalOutcome.Expired, "expired long signal must not count as SL");
+    Assert(StrategyRules.EvaluateSignal("SHORT", 120m, 105m, 90m, signalAt, afterExpiry,
+        TimeSpan.FromHours(24)) == SignalOutcome.Expired, "expired short signal must not count as SL");
+    Assert(StrategyRules.EvaluateSignal("LONG", 110m, 95m, 110m, signalAt, signalAt.AddHours(2),
+        TimeSpan.FromHours(24)) == SignalOutcome.HitTakeProfit, "active long TP should resolve");
+    Assert(StrategyRules.EvaluateSignal("SHORT", 106m, 105m, 90m, signalAt, signalAt.AddHours(2),
+        TimeSpan.FromHours(24)) == SignalOutcome.HitStopLoss, "active short SL should resolve");
+    Assert(StrategyRules.EvaluateSignal("LONG", 0m, 95m, 110m, signalAt, afterExpiry,
+        TimeSpan.FromHours(24)) == SignalOutcome.Expired,
+        "an expired signal must resolve even when the exchange price endpoint is unavailable");
 });
 
 Run("long and short plans have correct threshold direction", () =>
@@ -622,7 +719,11 @@ Run("legacy SQLite database upgrades safely and idempotently", () =>
             Assert(HasColumn(verify, "OpenTrades", "OcoStatus"), "OpenTrades.OcoStatus missing");
             Assert(HasColumn(verify, "OpenTrades", "OcoOrderIds"), "OpenTrades.OcoOrderIds missing");
             Assert(HasColumn(verify, "SignalTracks", "TradeMode"), "SignalTracks.TradeMode missing");
+            Assert(HasColumn(verify, "SignalTracks", "ExchangeCode"), "SignalTracks.ExchangeCode missing");
+            Assert(HasColumn(verify, "AnalysisResults", "ExchangeCode"), "AnalysisResults.ExchangeCode missing");
             Assert(TableExists(verify, "UserExchangeAccounts"), "user exchange account table missing");
+            Assert(TableExists(verify, "UserSignalPreferences"), "user signal preferences table missing");
+            Assert(TableExists(verify, "SignalEvaluationLogs"), "signal evaluation audit table missing");
             Assert(TableExists(verify, "ManualOrderApprovals"), "manual approvals table missing");
             Assert(HasColumn(verify, "ManualOrderApprovals", "Leverage"), "manual approval leverage column missing");
             Assert(HasColumn(verify, "ManualOrderApprovals", "PriceGuard"), "manual approval price guard column missing");
@@ -641,6 +742,19 @@ Run("legacy SQLite database upgrades safely and idempotently", () =>
             }
             Assert(orphanRejected, "exchange account must belong to a registered user");
 
+            using (var audit = verify.CreateCommand())
+            {
+                audit.CommandText = """
+                    INSERT INTO SignalEvaluationLogs(SignalTrackId, CheckedAt, MarketPrice, Outcome, Details)
+                    SELECT Id, $at, 101, 'Pending', 'migration audit test'
+                    FROM SignalTracks WHERE Symbol='BTCUSDT' LIMIT 1;
+                    SELECT COUNT(1) FROM SignalEvaluationLogs WHERE Details='migration audit test';
+                    """;
+                audit.Parameters.AddWithValue("$at", DateTime.UtcNow.ToString("o"));
+                Assert(Convert.ToInt32(audit.ExecuteScalar()) == 1,
+                    "signal evaluation log must persist against its tracked signal");
+            }
+
             using var data = verify.CreateCommand();
             data.CommandText = "SELECT Side, Leverage, TradeMode, ExchangeCode FROM OpenTrades WHERE ChatId=123";
             using var reader = data.ExecuteReader();
@@ -650,6 +764,38 @@ Run("legacy SQLite database upgrades safely and idempotently", () =>
             Assert(reader.GetString(2) == "MARGIN", "legacy mode default incorrect");
             Assert(reader.GetString(3) == "NOBITEX", "legacy exchange default incorrect");
         }
+    }
+    finally
+    {
+        if (File.Exists(path)) File.Delete(path);
+    }
+});
+
+Run("signal source preferences default to Nobitex and persist independently per user", () =>
+{
+    string path = Path.Combine(Path.GetTempPath(), $"crypto-analyzer-signal-prefs-{Guid.NewGuid():N}.db");
+    string cs = new SqliteConnectionStringBuilder { DataSource = path, Pooling = false, ForeignKeys = true }.ToString();
+    try
+    {
+        DatabaseInitializer.Initialize(cs);
+        using (var connection = new SqliteConnection(cs))
+        {
+            connection.Open();
+            using var command = connection.CreateCommand();
+            command.CommandText = "INSERT INTO Users(ChatId) VALUES (111),(222)";
+            command.ExecuteNonQuery();
+        }
+
+        var repository = new UserSignalPreferenceRepository(cs);
+        Assert(repository.GetSource(111) == SignalSourcePreference.Nobitex,
+            "new users must retain the backward-compatible Nobitex default");
+        Assert(repository.SetSource(111, SignalSourcePreference.Binance), "Binance preference should save");
+        Assert(repository.SetSource(222, SignalSourcePreference.Both), "Both preference should save");
+        Assert(repository.GetSource(111) == SignalSourcePreference.Binance, "user 111 preference was not persisted");
+        Assert(repository.GetSource(222) == SignalSourcePreference.Both, "user 222 preference was not persisted");
+        Assert(!repository.SetSource(111, "INVALID"), "invalid source must be rejected");
+        Assert(repository.GetSource(111) == SignalSourcePreference.Binance,
+            "invalid preference must not overwrite the valid user preference");
     }
     finally
     {

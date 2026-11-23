@@ -13,6 +13,7 @@ class Program
 {
     // Fail-closed until the complete multi-exchange order lifecycle has passed tests.
     private const bool TradingExecutionEnabled = false;
+    private const bool TradingFeaturesEnabled = false;
     const string OllamaModel = "llama3.2:latest";
     const string OllamaUrl = "http://127.0.0.1:11434";
     static readonly string TelegramToken = Environment.GetEnvironmentVariable("TELEGRAM_BOT_TOKEN") ?? "";
@@ -22,8 +23,14 @@ class Program
         new HttpClient { Timeout = TimeSpan.FromSeconds(15) }, NobitexReadOnly);
     static readonly HttpClient BinanceTestnetHttpClient = new() { Timeout = TimeSpan.FromSeconds(15) };
     static readonly BinanceSpotTestnetReadOnlyAdapter BinanceTestnetReadOnly = new(BinanceTestnetHttpClient);
+    static readonly HttpClient BinancePublicHttpClient = new()
+    {
+        BaseAddress = new Uri("https://data-api.binance.vision"),
+        Timeout = TimeSpan.FromSeconds(15)
+    };
+    static readonly BinancePublicMarketData BinancePublicMarket = new(BinancePublicHttpClient);
     static readonly string NobitexBaseUrl = "https://apiv2.nobitex.ir";
-    private const string DatabaseConnectionString = "Data Source=crypto_analyzer.db;Foreign Keys=True";
+    private static readonly string DatabaseConnectionString = CreateDatabaseConnectionString();
     static decimal UsdtTomanRate = 276_000m;
     static readonly Dictionary<string, string> SignalPayloads = new();
     static readonly Dictionary<long, PendingOrder> PendingOrders = new();
@@ -77,6 +84,7 @@ class Program
         Console.OutputEncoding = System.Text.Encoding.UTF8;
         Console.WriteLine("Crypto Analyzer - Multi User");
         Console.WriteLine("SELL only for open trades | Users must /start");
+        Console.WriteLine($"Database: {new SqliteConnectionStringBuilder(DatabaseConnectionString).DataSource}");
         Console.WriteLine("Press Ctrl+C to stop\n");
 
         InitializeDatabase();
@@ -95,6 +103,7 @@ class Program
 
         // گوش دادن به دکمه و دستورهای تلگرام
         _ = Task.Run(() => ListenTelegramCommands(botClient, restClient));
+        _ = Task.Run(MonitorPendingSignalsAsync);
 
         while (true)
         {
@@ -102,81 +111,73 @@ class Program
             {
                 Console.WriteLine($"\n===== {DateTime.Now:yyyy-MM-dd HH:mm:ss} =====");
 
-                // 1) بررسی حد ضرر / هدف سود معاملات باز همه کاربران
-                await CheckOpenTrades(restClient, botClient);
-
-                await ResolvePendingSignals();
-
-                // 2) لیست ارزهای پرمعامله
-                var symbols = await GetTopVolumeSymbols(restClient);
-                Console.WriteLine($"Analyzing {symbols.Count} symbols...\n");
-
-                // 3) فقط سیگنال‌های BUY (پیشنهاد ورود)
-                var buySignals = new List<(string Text, InlineKeyboardMarkup? Keyboard)>();
-
-                foreach (var symbol in symbols)
-                {
-                    var signals = await AnalyzeSymbol(restClient, symbol);
-                    if (signals is not null)
-                        buySignals.AddRange(signals);
-
-                    await Task.Delay(500);
-                }
-
-                // 4) کاربران فعال
+                // Generate each market independently. A user's preference only controls
+                // delivery; candle/price/SL/TP data are never mixed between exchanges.
                 var users = GetActiveChatIds();
                 Console.WriteLine($"Active users: {users.Count}");
-                Console.WriteLine($"BUY signals: {buySignals.Count}");
+                if (users.Count == 0)
+                    Console.WriteLine("Signal scan skipped: no active users found in the configured database. Send /start to the bot.");
+                var preferences = new UserSignalPreferenceRepository(DatabaseConnectionString);
+                var sourcesByUser = users.ToDictionary(chatId => chatId, preferences.GetSource);
+                var sourceSignals = new Dictionary<string, List<(string Text, InlineKeyboardMarkup? Keyboard)>>();
+
+                if (sourcesByUser.Values.Any(x => x is SignalSourcePreference.Nobitex or SignalSourcePreference.Both))
+                {
+                    var nobitexSymbols = await GetTopVolumeSymbols(restClient);
+                    Console.WriteLine($"Analyzing {nobitexSymbols.Count} Nobitex markets...");
+                    var signals = new List<(string Text, InlineKeyboardMarkup? Keyboard)>();
+                    foreach (var symbol in nobitexSymbols)
+                    {
+                        var result = await AnalyzeSymbol(restClient, symbol, SignalSourcePreference.Nobitex);
+                        if (result is not null) signals.AddRange(result);
+                        await Task.Delay(500);
+                    }
+                    sourceSignals[SignalSourcePreference.Nobitex] = signals;
+                }
+
+                if (sourcesByUser.Values.Any(x => x is SignalSourcePreference.Binance or SignalSourcePreference.Both))
+                {
+                    var binanceSymbols = await BinancePublicMarket.GetTopUsdtSymbolsAsync(20);
+                    Console.WriteLine($"Analyzing {binanceSymbols.Count} Binance markets...");
+                    var signals = new List<(string Text, InlineKeyboardMarkup? Keyboard)>();
+                    foreach (var symbol in binanceSymbols)
+                    {
+                        var result = await AnalyzeSymbol(restClient, symbol, SignalSourcePreference.Binance);
+                        if (result is not null) signals.AddRange(result);
+                        await Task.Delay(500);
+                    }
+                    sourceSignals[SignalSourcePreference.Binance] = signals;
+                }
+
+                Console.WriteLine($"Signals: {sourceSignals.Sum(x => x.Value.Count)}");
 
                 foreach (var chatId in users)
                 {
-                    // 4-a) ارسال پیشنهادهای خرید به همه
-                    foreach (var (text, keyboard) in buySignals)
-                    {
-                        try
-                        {
-                            await botClient.SendMessage(chatId, text, replyMarkup: keyboard);
-                        }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Send BUY fail {chatId}: {ex.Message}");
-                        }
-                        await Task.Delay(50);
-                    }
+                    var selectedSources = sourcesByUser[chatId] == SignalSourcePreference.Both
+                        ? new[] { SignalSourcePreference.Nobitex, SignalSourcePreference.Binance }
+                        : new[] { sourcesByUser[chatId] };
 
-                    // 4-b) SELL فقط برای ارزهایی که این کاربر خرید کرده و معامله باز دارد
-                    var openTrades = GetOpenTrades(chatId);
-                    foreach (var trade in openTrades)
+                    foreach (var source in selectedSources)
                     {
-                        try
+                        if (!sourceSignals.TryGetValue(source, out var selectedSignals)) continue;
+                        foreach (var (text, keyboard) in selectedSignals)
                         {
-                            var sellText = await AnalyzeSellForOpenTrade(trade);
-                            if (string.IsNullOrEmpty(sellText))
-                                continue;
-
-                            var sellKeyboard = new InlineKeyboardMarkup(new[]
+                            try
                             {
-                            new[]
-                            {
-                                InlineKeyboardButton.WithCallbackData("✅ خروج را دستی انجام دادم", $"sold|{trade.Id}")
+                                await botClient.SendMessage(chatId, text, replyMarkup: MainReplyKeyboard());
                             }
-                        });
-
-                            await botClient.SendMessage(chatId, sellText, replyMarkup: sellKeyboard);
-                            MarkExitSuggested(trade.Id, "StrategyExit");
-                            Console.WriteLine($"SELL sent to {chatId} for {trade.Symbol}");
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine($"Send {source} signal fail {chatId}: {ex.Message}");
+                            }
+                            await Task.Delay(50);
                         }
-                        catch (Exception ex)
-                        {
-                            Console.WriteLine($"Send SELL fail {chatId}/{trade.Symbol}: {ex.Message}");
-                        }
-
-                        await Task.Delay(300);
                     }
+
                 }
 
-                if (buySignals.Count == 0)
-                    Console.WriteLine("No BUY signals this round.");
+                if (sourceSignals.Values.Sum(x => x.Count) == 0)
+                    Console.WriteLine("No signals this round.");
 
                 Console.WriteLine($"Next run at {DateTime.Now.AddMinutes(3):HH:mm}");
             }
@@ -195,6 +196,35 @@ class Program
 
             await Task.Delay(TimeSpan.FromMinutes(3));
         }
+    }
+
+    static async Task MonitorPendingSignalsAsync()
+    {
+        Console.WriteLine("Signal outcome monitor started (60-second interval; no order execution).");
+        while (true)
+        {
+            try
+            {
+                await ResolvePendingSignals();
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"Signal monitor error: {ex.Message}");
+            }
+
+            await Task.Delay(TimeSpan.FromMinutes(1));
+        }
+    }
+
+    static string CreateDatabaseConnectionString()
+    {
+        string configuredPath = Environment.GetEnvironmentVariable("CRYPTO_ANALYZER_DB_PATH") ?? "";
+        string path = string.IsNullOrWhiteSpace(configuredPath)
+            ? Path.Combine(AppContext.BaseDirectory, "crypto_analyzer.db")
+            : Path.GetFullPath(configuredPath);
+        string? directory = Path.GetDirectoryName(path);
+        if (!string.IsNullOrWhiteSpace(directory)) Directory.CreateDirectory(directory);
+        return new SqliteConnectionStringBuilder { DataSource = path, ForeignKeys = true }.ToString();
     }
 
     static byte[] FromUrlSafeBase64(string s)
@@ -470,9 +500,9 @@ class Program
         }
     }
 
-    static bool HasPendingSignal(string symbol, string tradeMode = "MARGIN")
+    static bool HasRecentSignal(string symbol, string tradeMode = "MARGIN", string exchangeCode = "NOBITEX")
     {
-        // اگر SignalTracks داری از DB بخوان؛ وگرنه false
+        // Avoid immediately re-entering the same symbol after a resolved signal.
         try
         {
             using var conn = new Microsoft.Data.Sqlite.SqliteConnection(DatabaseConnectionString);
@@ -480,9 +510,11 @@ class Program
             var cmd = conn.CreateCommand();
             cmd.CommandText = @"
 SELECT COUNT(1) FROM SignalTracks
-WHERE Symbol=$s AND TradeMode=$m AND Status='Pending'";
+WHERE Symbol=$s AND TradeMode=$m AND ExchangeCode=$exchange AND SignalAt >= $cutoff";
             cmd.Parameters.AddWithValue("$s", symbol);
             cmd.Parameters.AddWithValue("$m", tradeMode);
+            cmd.Parameters.AddWithValue("$exchange", exchangeCode);
+            cmd.Parameters.AddWithValue("$cutoff", DateTime.UtcNow.AddHours(-4).ToString("o"));
             var n = Convert.ToInt32(cmd.ExecuteScalar());
             return n > 0;
         }
@@ -584,7 +616,7 @@ WHERE Symbol=$s AND TradeMode=$m AND Status='Pending'";
         return set;
     }
 
-    static void TrackSignal(string symbol, decimal entry, decimal sl, decimal tp,
+    static long? TrackSignal(string symbol, decimal entry, decimal sl, decimal tp,
         string side = "LONG", string tradeMode = "MARGIN", string exchangeCode = "NOBITEX")
     {
         try
@@ -598,7 +630,8 @@ WHERE Symbol=$s AND TradeMode=$m AND Status='Pending'";
 INSERT INTO SignalTracks
     (Symbol, Side, TradeMode, ExchangeCode, EntryPrice, StopLoss, TakeProfit, Status, SignalAt)
 VALUES
-    ($s, $side, $mode, $exchange, $e, $sl, $tp, 'Pending', $t);";
+    ($s, $side, $mode, $exchange, $e, $sl, $tp, 'Pending', $t);
+SELECT last_insert_rowid();";
             cmd.Parameters.AddWithValue("$s", symbol);
             cmd.Parameters.AddWithValue("$side", side);
             cmd.Parameters.AddWithValue("$mode", tradeMode);
@@ -607,11 +640,38 @@ VALUES
             cmd.Parameters.AddWithValue("$sl", sl);
             cmd.Parameters.AddWithValue("$tp", tp);
             cmd.Parameters.AddWithValue("$t", DateTime.UtcNow.ToString("o"));
-            cmd.ExecuteNonQuery();
+            long id = Convert.ToInt64(cmd.ExecuteScalar());
+            LogSignalEvaluation(id, entry, "CREATED", "Signal created and persisted before Telegram delivery.");
+            Console.WriteLine($"Signal #{id} tracked: {exchangeCode}/{symbol} {side} entry={entry:N8} SL={sl:N8} TP={tp:N8}");
+            return id;
         }
         catch (Exception ex)
         {
             Console.WriteLine($"TrackSignal: {ex.Message}");
+            return null;
+        }
+    }
+
+    static void LogSignalEvaluation(long signalId, decimal? price, string outcome, string? details = null)
+    {
+        try
+        {
+            using var conn = new SqliteConnection(DatabaseConnectionString);
+            conn.Open();
+            using var cmd = conn.CreateCommand();
+            cmd.CommandText = @"
+INSERT INTO SignalEvaluationLogs(SignalTrackId, CheckedAt, MarketPrice, Outcome, Details)
+VALUES($id, $at, $price, $outcome, $details);";
+            cmd.Parameters.AddWithValue("$id", signalId);
+            cmd.Parameters.AddWithValue("$at", DateTime.UtcNow.ToString("o"));
+            cmd.Parameters.AddWithValue("$price", price is null ? DBNull.Value : price.Value);
+            cmd.Parameters.AddWithValue("$outcome", outcome);
+            cmd.Parameters.AddWithValue("$details", details is null ? DBNull.Value : details);
+            cmd.ExecuteNonQuery();
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"Signal evaluation log #{signalId}: {ex.Message}");
         }
     }
 
@@ -643,9 +703,9 @@ VALUES
                         var answer = uiResult?.Text ?? await HandleCallback(chatId, callbackData, restClient);
                         await bot.AnswerCallbackQuery(cb.Id, answer.Length > 180 ? answer[..180] : answer);
                         if (uiResult is not null)
-                            await bot.SendMessage(chatId, answer, replyMarkup: uiResult.Value.Keyboard);
+                            await bot.SendMessage(chatId, answer, replyMarkup: MainReplyKeyboard());
                         else
-                            await bot.SendMessage(chatId, answer, replyMarkup: MainMenuKeyboard());
+                            await bot.SendMessage(chatId, answer, replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
@@ -668,7 +728,7 @@ VALUES
                             accountLink.Step = "apikey";
                             await bot.SendMessage(userChatId,
                                 "اکنون API Key عمومی نوبیتکس را ارسال کن. از پنل نوبیتکس یک API Key با دسترسی READ بساز (برای ثبت سفارش در نسخه آینده، TRADE هم لازم می‌شود). دسترسی WITHDRAW را فعال نکن. پیام کلید پس از دریافت حذف می‌شود.",
-                                replyMarkup: CancelWizardKeyboard());
+                                replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -687,7 +747,7 @@ VALUES
                             text = string.Empty;
                             await bot.SendMessage(userChatId,
                                 "حالا کلید خصوصی (API Secret / Private Key) متناظر با همین API Key را ارسال کن. این کلید فقط برای امضای درخواست‌ها استفاده می‌شود و به‌صورت رمزنگاری‌شده ذخیره خواهد شد. پیام پس از دریافت حذف می‌شود.",
-                                replyMarkup: CancelWizardKeyboard());
+                                replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -735,7 +795,7 @@ VALUES
                                 AccountLinkStates.TryRemove(userChatId, out _);
                                 await bot.SendMessage(userChatId,
                                     $"✅ کلیدهای API حساب «{accountLink.Label}» با امضای Ed25519 تأیید و ذخیره شدند (شناسه #{accountId}). کلید عمومی و خصوصی به‌صورت رمزنگاری‌شده ذخیره شدند. فعلاً اجرای سفارش واقعی غیرفعال است.",
-                                    replyMarkup: AccountMenuKeyboard());
+                                    replyMarkup: MainReplyKeyboard());
                             }
                             catch (Exception ex) when (ex is HttpRequestException or TaskCanceledException or UnauthorizedAccessException or System.Text.Json.JsonException)
                             {
@@ -760,7 +820,7 @@ VALUES
                         AccountLinkStates.TryRemove(userChatId, out _);
                         OrderWizards.TryRemove(userChatId, out _);
                         ManualUiStates.TryRemove(userChatId, out _);
-                        await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: MainMenuKeyboard());
+                        await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
@@ -769,22 +829,50 @@ VALUES
                     {
                         RegisterUser(userChatId, msg.From?.Username, msg.From?.FirstName);
                         await bot.SendMessage(userChatId,
-                            "خوش آمدید ✅\nاز منوی زیر برای مدیریت ربات و حساب‌ها استفاده کنید.",
-                            replyMarkup: MainMenuKeyboard());
+                            "خوش آمدید ✅\nاز صفحه‌کلید ثابت پایین برای انتخاب بخش‌ها استفاده کنید. خرید و فروش در این نسخه غیرفعال است.",
+                            replyMarkup: MainReplyKeyboard());
+                        continue;
+                    }
+
+                    // Reply Keyboard sends ordinary text instead of callback queries.
+                    // Keep the main navigation in the persistent keyboard, not below messages.
+                    string? menuAction = text switch
+                    {
+                        "📊 تحلیل و گزارش" => "ui|analysismenu",
+                        "⚙️ تنظیمات" => "ui|settingsmenu",
+                        "💼 حساب‌ها" => "ui|accountsmenu",
+                        "📡 منبع سیگنال" => "ui|signalsource",
+                        "📑 گزارش سیگنال‌ها" => "ui|report",
+                        "📊 آمار سیگنال‌ها" => "ui|stats",
+                        "⏸ توقف سیگنال" => "ui|stop",
+                        "▶️ فعال‌سازی سیگنال" => "ui|start",
+                        "🆘 راهنما" => "ui|help",
+                        "🇮🇷 فقط نوبیتکس" => "ui|signalsource|NOBITEX",
+                        "🟡 فقط بایننس" => "ui|signalsource|BINANCE",
+                        "🔀 هر دو صرافی" => "ui|signalsource|BOTH",
+                        "🏠 منوی اصلی" => "ui|home",
+                        "↩️ بازگشت" => "ui|settingsmenu",
+                        _ => null
+                    };
+                    if (menuAction is not null)
+                    {
+                        var menuResult = await HandleUiCallback(userChatId, menuAction);
+                        await bot.SendMessage(userChatId, menuResult?.Text ?? "گزینه نامعتبر است.",
+                            replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
                     if (OrderWizards.TryGetValue(userChatId, out var wizard) && !text.StartsWith('/'))
                     {
                         var (wizardText, wizardKeyboard) = await HandleOrderWizardInput(userChatId, text);
-                        await bot.SendMessage(userChatId, wizardText, replyMarkup: wizardKeyboard);
+                        await bot.SendMessage(userChatId, wizardText, replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
                     if (ManualUiStates.ContainsKey(userChatId) && !text.StartsWith('/'))
                     {
                         var (uiText, uiKeyboard) = await HandleManualUiInput(userChatId, text);
-                        await bot.SendMessage(userChatId, uiText, replyMarkup: uiKeyboard);
+                        await bot.SendMessage(userChatId, uiText, replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
@@ -804,7 +892,7 @@ VALUES
                         string[] commandParts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                         if (commandParts.Length != 2 || !long.TryParse(commandParts[1], out long accountId) || accountId <= 0)
                         {
-                            await bot.SendMessage(userChatId, "برای بررسی اتصال، از منوی «حساب‌ها و صرافی‌ها» حساب موردنظر را انتخاب کنید.", replyMarkup: AccountMenuKeyboard());
+                            await bot.SendMessage(userChatId, "برای بررسی اتصال، از منوی «حساب‌ها» استفاده کنید.", replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -839,7 +927,7 @@ VALUES
                         string[] commandParts = text.Split(' ', StringSplitOptions.RemoveEmptyEntries);
                         if (commandParts.Length != 2 || !long.TryParse(commandParts[1], out long accountId) || accountId <= 0)
                         {
-                            await bot.SendMessage(userChatId, "برای مشاهده موجودی، از منوی «حساب‌ها و صرافی‌ها» حساب موردنظر را انتخاب کنید.", replyMarkup: AccountMenuKeyboard());
+                            await bot.SendMessage(userChatId, "برای مشاهده موجودی، از منوی «حساب‌ها» استفاده کنید.", replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -879,15 +967,16 @@ VALUES
 
                     if (text.StartsWith("/preview", StringComparison.OrdinalIgnoreCase))
                     {
-                        var (previewText, previewKeyboard) = CreateManualOrderPreview(userChatId, text);
-                        await bot.SendMessage(userChatId, previewText, replyMarkup: previewKeyboard);
+                        await bot.SendMessage(userChatId,
+                            "قابلیت خرید، فروش و ساخت پیش‌نویس سفارش فعلاً غیرفعال است. فقط تحلیل و دریافت سیگنال فعال است.",
+                            replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
                     if (text.StartsWith("/stop"))
                     {
                         SetUserActive(userChatId, false);
-                        await bot.SendMessage(userChatId, "سیگنال‌ها برای شما متوقف شد. برای فعال‌سازی دوباره از دکمه «فعال‌سازی سیگنال» در منو استفاده کنید.", replyMarkup: MainMenuKeyboard());
+                        await bot.SendMessage(userChatId, "سیگنال‌ها برای شما متوقف شد. برای فعال‌سازی دوباره از صفحه‌کلید پایین استفاده کنید.", replyMarkup: MainReplyKeyboard());
                         continue;
                     }
 
@@ -899,7 +988,7 @@ VALUES
                             PendingOrders.Remove(userChatId);
                             OrderWizards.TryRemove(userChatId, out _);
                             ManualUiStates.TryRemove(userChatId, out _);
-                            await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: TradesMenuKeyboard());
+                            await bot.SendMessage(userChatId, "فرآیند لغو شد.", replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -912,7 +1001,7 @@ VALUES
                         {
                             await bot.SendMessage(userChatId,
                                 "عدد معتبر نیست.\nمثال: 300000\nحداقل ۵۰٬۰۰۰ تومان\nبرای لغو از دکمه لغو استفاده کنید.",
-                                replyMarkup: CancelWizardKeyboard());
+                                replyMarkup: MainReplyKeyboard());
                             continue;
                         }
 
@@ -938,14 +1027,14 @@ VALUES
                             $"Entry≈ {pending.Entry:N4}\n" +
                             $"SL: {pending.StopLoss:N4} | TP: {pending.TakeProfit:N4}\n\n" +
                             $"اگر درست است تأیید نهایی را بزن.",
-                            replyMarkup: kb);
+                            replyMarkup: MainReplyKeyboard());
 
                         continue; // خیلی مهم
                     }
 
                     var reply = await HandleUserCommand(userChatId, text, restClient);
                     if (!string.IsNullOrEmpty(reply))
-                        await bot.SendMessage(userChatId, reply, replyMarkup: MainMenuKeyboard());
+                        await bot.SendMessage(userChatId, reply, replyMarkup: MainReplyKeyboard());
                 }
             }
             catch (Exception ex)
@@ -955,6 +1044,21 @@ VALUES
             }
         }
     }
+
+    static ReplyKeyboardMarkup MainReplyKeyboard() => new(new[]
+    {
+        new KeyboardButton[] { "📊 تحلیل و گزارش", "⚙️ تنظیمات" },
+        new KeyboardButton[] { "📡 منبع سیگنال", "📑 گزارش سیگنال‌ها" },
+        new KeyboardButton[] { "🇮🇷 فقط نوبیتکس", "🟡 فقط بایننس" },
+        new KeyboardButton[] { "🔀 هر دو صرافی", "📊 آمار سیگنال‌ها" },
+        new KeyboardButton[] { "⏸ توقف سیگنال", "▶️ فعال‌سازی سیگنال" },
+        new KeyboardButton[] { "💼 حساب‌ها", "🆘 راهنما" }
+    })
+    {
+        ResizeKeyboard = true,
+        IsPersistent = true,
+        InputFieldPlaceholder = "یک بخش را انتخاب کنید"
+    };
 
     static InlineKeyboardMarkup MainMenuKeyboard() => new(new[]
     {
@@ -978,8 +1082,7 @@ VALUES
 
     static InlineKeyboardMarkup TradesMenuKeyboard() => new(new[]
     {
-        new[] { InlineKeyboardButton.WithCallbackData("📝 خرید/فروش + حد ضرر و سود", "ui|neworder"), InlineKeyboardButton.WithCallbackData("📂 معاملات باز", "ui|open") },
-        new[] { InlineKeyboardButton.WithCallbackData("➕ ثبت خرید در دفتر", "ui|bought"), InlineKeyboardButton.WithCallbackData("❌ لغو فرآیند/سفارش معلق", "ui|cancel") },
+        new[] { InlineKeyboardButton.WithCallbackData("📂 مشاهده معاملات ثبت‌شده", "ui|open") },
         new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
     });
 
@@ -994,12 +1097,21 @@ VALUES
     static InlineKeyboardMarkup SettingsMenuKeyboard() => new(new[]
     {
         new[] { InlineKeyboardButton.WithCallbackData("💱 مشاهده نرخ تتر", "ui|rate"), InlineKeyboardButton.WithCallbackData("✏️ تنظیم نرخ تتر", "ui|rateedit") },
+        new[] { InlineKeyboardButton.WithCallbackData("📡 منبع سیگنال‌ها", "ui|signalsource") },
         new[] { InlineKeyboardButton.WithCallbackData("🏠 منوی اصلی", "ui|home") }
     });
 
     static async Task<(string Text, InlineKeyboardMarkup? Keyboard)?> HandleUiCallback(long chatId, string data)
     {
         var p = data.Split('|');
+        if (!TradingFeaturesEnabled &&
+            ((p.Length == 2 && p[0] is "approve_order" or "reject_order") ||
+             (p.Length >= 2 && p[0] == "ui" && p[1] is
+                 "sigtrade" or "sigaccount" or "neworder" or "orderaccount" or "mode" or "side" or "type" or
+                 "spotoco" or "registerapproved" or "bought" or "buycurrent" or "buymanual" or "buyconfirm" or "cancelpending")))
+        {
+            return ("قابلیت خرید، فروش و ثبت سفارش فعلاً غیرفعال است. در این نسخه فقط تحلیل، دریافت سیگنال و مشاهده گزارش‌ها فعال است.", TradesMenuKeyboard());
+        }
         if (p.Length == 2 && p[0] == "approve_order")
         {
             var repository = new ManualOrderApprovalRepository(DatabaseConnectionString);
@@ -1040,6 +1152,9 @@ VALUES
                     return ("این پیشنهاد منقضی شده است؛ برای دریافت پیشنهاد تازه منتظر تحلیل بعدی بمان.", MainMenuKeyboard());
                 var signalAccounts = accounts.Where(a => a.IsActive &&
                     a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase)).ToList();
+                var selectedPayload = SignalPayloads[p[2]].Split('|');
+                if (selectedPayload.Length < 8 || !selectedPayload[7].Equals(SignalSourcePreference.Nobitex, StringComparison.OrdinalIgnoreCase))
+                    return ("این سیگنال از بایننس است؛ فعلاً فقط ثبت آزمایشی در دفتر مجاز است و مسیر سفارش نوبیتکس برای آن نمایش داده نمی‌شود.", MainMenuKeyboard());
                 if (signalAccounts.Count == 0)
                     return ("برای معامله از روی پیشنهاد، ابتدا حساب نوبیتکس را متصل کن. اتصال فعلی فقط خواندنی است و سفارش تا زمان فعال‌سازی صریح اجرا ارسال نمی‌کند.", AccountMenuKeyboard());
                 return ($"حساب نوبیتکس برای {(p[3] == "buy" ? "خرید" : "فروش")} را انتخاب کن:",
@@ -1052,11 +1167,13 @@ VALUES
             {
                 if (!SignalPayloads.TryGetValue(p[2], out var signalPayload))
                     return ("این پیشنهاد منقضی شده است؛ از پیشنهاد جدید استفاده کن.", MainMenuKeyboard());
+                var signalParts = signalPayload.Split('|');
+                if (signalParts.Length < 8 || !signalParts[7].Equals(SignalSourcePreference.Nobitex, StringComparison.OrdinalIgnoreCase))
+                    return ("این مسیر فقط برای سیگنال‌های نوبیتکس است؛ سیگنال بایننس فعلاً فقط قابلیت ثبت آزمایشی در دفتر را دارد.", MainMenuKeyboard());
                 var selectedSignalAccount = accounts.FirstOrDefault(a => a.Id == signalAccountId && a.IsActive &&
                     a.ExchangeCode.Equals("NOBITEX", StringComparison.OrdinalIgnoreCase));
                 if (selectedSignalAccount is null)
                     return ("حساب فعال نوبیتکس متعلق به شما پیدا نشد.", AccountMenuKeyboard());
-                var signalParts = signalPayload.Split('|');
                 if (signalParts.Length < 7 || !decimal.TryParse(signalParts[2], System.Globalization.NumberStyles.Number,
                         System.Globalization.CultureInfo.InvariantCulture, out var signalEntry) ||
                     !decimal.TryParse(signalParts[3], System.Globalization.NumberStyles.Number,
@@ -1093,8 +1210,39 @@ VALUES
             case "tradesmenu": return ("مدیریت معاملات:", TradesMenuKeyboard());
             case "analysismenu": return ("تحلیل، گزارش و وضعیت سیگنال‌ها:", AnalysisMenuKeyboard());
             case "settingsmenu": return ($"تنظیمات ربات | نرخ فعلی تتر: {UsdtTomanRate:N0} تومان", SettingsMenuKeyboard());
+            case "signalsource" when p.Length == 3:
+            {
+                if (!SignalSourcePreference.IsValid(p[2]))
+                    return ("منبع انتخاب‌شده معتبر نیست.", SettingsMenuKeyboard());
+                bool saved = new UserSignalPreferenceRepository(DatabaseConnectionString).SetSource(chatId, p[2]);
+                if (!saved) return ("ابتدا /start را بزن تا حساب کاربری‌ات ثبت شود.", MainMenuKeyboard());
+                string label = p[2] switch
+                {
+                    SignalSourcePreference.Binance => "فقط بایننس",
+                    SignalSourcePreference.Both => "هر دو صرافی به‌صورت مستقل",
+                    _ => "فقط نوبیتکس"
+                };
+                return ($"✅ منبع سیگنال روی «{label}» تنظیم شد. از چرخه تحلیل بعدی اعمال می‌شود.", SettingsMenuKeyboard());
+            }
+            case "signalsource":
+            {
+                string source = new UserSignalPreferenceRepository(DatabaseConnectionString).GetSource(chatId);
+                string label = source switch
+                {
+                    SignalSourcePreference.Binance => "فقط بایننس",
+                    SignalSourcePreference.Both => "هر دو صرافی، مستقل از هم",
+                    _ => "فقط نوبیتکس"
+                };
+                return ($"منبع فعلی سیگنال: {label}\n\nمنبع موردنظر را انتخاب کن:", new InlineKeyboardMarkup(new[]
+                {
+                    new[] { InlineKeyboardButton.WithCallbackData("🇮🇷 فقط نوبیتکس", "ui|signalsource|NOBITEX") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🟡 فقط بایننس", "ui|signalsource|BINANCE") },
+                    new[] { InlineKeyboardButton.WithCallbackData("🔀 هر دو (جداگانه)", "ui|signalsource|BOTH") },
+                    new[] { InlineKeyboardButton.WithCallbackData("↩️ تنظیمات", "ui|settingsmenu") }
+                }));
+            }
             case "help":
-                return ("راهنمای ربات\n\n• حساب‌ها، اتصال و موجودی: فقط خواندنی\n• خرید/فروش: با دکمه‌ها حساب، Spot/Margin، سمت، نوع سفارش، مقدار و قیمت را انتخاب کنید.\n• خرید Spot: پس از اجرای دستی خرید و ثبت قیمت واقعی، پوزیشن و مقدار آن در دفتر ذخیره می‌شود؛ از فهرست معاملات باز می‌توان درخواست OCO خروج (حد سود + حد ضرر) را جداگانه ثبت کرد.\n• OCO Spot موجودی آزاد و قیمت لحظه‌ای را بررسی می‌کند؛ اگر قیمت از محدوده حدها عبور کرده باشد، درخواست رد می‌شود.\n• Margin: ورود Limit و هر دو حد ضرر/سود الزامی است؛ OCO بستن پوزیشن تعهدی از قبل در آداپتر موجود است.\n• تأیید سفارش ورود هنوز فقط پیش‌نویس را برای اجرای دستی تأیید می‌کند و سفارش ورود نمی‌فرستد.\n• اجرای واقعی از قفل ایمنی سراسری پیروی می‌کند و در این نسخه غیرفعال است؛ تست‌های فعلی با Mock هستند.\n• برای ورود نماد، مقدار، قیمت و حدها، فقط متن عددی/نماد را در مرحله مربوطه ارسال کنید.", BackHomeKeyboard("ui|home"));
+                return ("راهنمای ربات\n\n• منبع سیگنال را از تنظیمات بین نوبیتکس، بایننس یا هر دو انتخاب کن؛ در حالت هر دو، قیمت و کندل‌ها کاملاً مستقل می‌مانند.\n• سیگنال بایننس با داده عمومی Spot ساخته می‌شود و برای تحلیل به API Key نیاز ندارد. ثبت پوزیشن بایننس در دفتر فقط آزمایشی/دستی است.\n• حساب‌ها، اتصال و موجودی نوبیتکس: فقط خواندنی\n• خرید/فروش: با دکمه‌ها حساب، Spot/Margin، سمت، نوع سفارش، مقدار و قیمت را انتخاب کنید.\n• خرید Spot نوبیتکس: پس از اجرای دستی خرید و ثبت قیمت واقعی، پوزیشن و مقدار آن در دفتر ذخیره می‌شود؛ از فهرست معاملات باز می‌توان درخواست OCO خروج را جداگانه ثبت کرد.\n• OCO Spot موجودی آزاد و قیمت لحظه‌ای را بررسی می‌کند؛ اگر قیمت از محدوده حدها عبور کرده باشد، درخواست رد می‌شود.\n• تأیید سفارش ورود هنوز فقط پیش‌نویس را برای اجرای دستی تأیید می‌کند و سفارش ورود نمی‌فرستد.\n• اجرای واقعی از قفل ایمنی سراسری پیروی می‌کند و در این نسخه غیرفعال است؛ تست‌های فعلی با Mock هستند.\n• برای ورود نماد، مقدار، قیمت و حدها، فقط متن عددی/نماد را در مرحله مربوطه ارسال کنید.", BackHomeKeyboard("ui|home"));
             case "cancel":
                 OrderWizards.TryRemove(chatId, out _);
                 ManualUiStates.TryRemove(chatId, out _);
@@ -1279,22 +1427,10 @@ VALUES
             case "open":
                 var open = GetOpenTrades(chatId);
                 if (open.Count == 0) return ("معامله بازی در دفتر شما وجود ندارد.", TradesMenuKeyboard());
-                var openRows = new List<InlineKeyboardButton[]>();
-                foreach (var trade in open)
-                {
-                    openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
-                        $"ثبت خروج: {trade.Side} {trade.Symbol} #{trade.Id}", $"sold|{trade.Id}") });
-                    if (trade.TradeMode == "SPOT" && trade.Side == "BUY" && trade.Quantity > 0 &&
-                        trade.OcoStatus is "NotSubmitted" or "Rejected")
-                        openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
-                            $"🛡 ثبت OCO خروج ({trade.Symbol})", $"ui|spotoco|{trade.Id}") });
-                    else if (trade.TradeMode == "SPOT" && trade.Side == "BUY" && trade.OcoStatus != "NotSubmitted")
-                        openRows.Add(new[] { InlineKeyboardButton.WithCallbackData(
-                            $"OCO {trade.Symbol}: {trade.OcoStatus}", "ui|noop") });
-                }
-                openRows.Add(new[] { InlineKeyboardButton.WithCallbackData("↩️ معاملات", "ui|tradesmenu"), InlineKeyboardButton.WithCallbackData("🏠 منو", "ui|home") });
-                return ("معاملات باز دفتر شما\nبرای Spot، پس از ثبت خرید واقعی می‌توانی OCO خروج را در صرافی ثبت کنی. ثبت خروج دستی فقط پس از خروج واقعی استفاده شود:",
-                    new InlineKeyboardMarkup(openRows));
+                string openText = string.Join("\n", open.Select(trade =>
+                    $"{trade.Side} {trade.Symbol} | {trade.TradeMode} | Entry: {trade.EntryPrice:N4} | SL: {trade.StopLoss:N4} | TP: {trade.TakeProfit:N4}"));
+                return ($"معاملات ثبت‌شده (فقط مشاهده):\n{openText}\n\nثبت یا بستن معامله در این نسخه غیرفعال است.",
+                    BackHomeKeyboard("ui|tradesmenu"));
             case "stats": return (GetPerformanceStats(chatId), AnalysisMenuKeyboard());
             case "report": return (GetSignalReport(), AnalysisMenuKeyboard());
             case "rate": return ($"نرخ فعلی تتر: {UsdtTomanRate:N0} تومان", SettingsMenuKeyboard());
@@ -1567,6 +1703,15 @@ VALUES
         if (string.IsNullOrWhiteSpace(data))
             return "دستور نامعتبر";
 
+        if (!TradingFeaturesEnabled &&
+            (data.StartsWith("note_", StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("sold|", StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("long|", StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("short|", StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("bought|", StringComparison.OrdinalIgnoreCase) ||
+             data.StartsWith("approve_order|", StringComparison.OrdinalIgnoreCase)))
+            return "ثبت، خرید و فروش معامله فعلاً غیرفعال است؛ فقط تحلیل و مشاهده سیگنال‌ها در دسترس است.";
+
         // ----- دکمه‌های کوتاه exec_xxx / note_xxx -----
         if (data.StartsWith("exec_", StringComparison.OrdinalIgnoreCase))
         {
@@ -1594,17 +1739,18 @@ VALUES
             };
             string symbol = p[1];
             string tradeMode = p.Length >= 7 ? p[6].ToUpperInvariant() : "MARGIN";
+            string exchangeCode = p.Length >= 8 ? p[7].ToUpperInvariant() : SignalSourcePreference.Nobitex;
             decimal entry = decimal.Parse(p[2], System.Globalization.CultureInfo.InvariantCulture);
             decimal sl = decimal.Parse(p[3], System.Globalization.CultureInfo.InvariantCulture);
             decimal tp = decimal.Parse(p[4], System.Globalization.CultureInfo.InvariantCulture);
             int lev = int.TryParse(p[5], out var lv) ? Math.Min(lv, 3) : 1;
 
             // note = فقط یادداشت در ربات
-            if (HasOpenTrade(chatId, symbol, tradeMode))
+            if (HasOpenTrade(chatId, symbol, tradeMode, exchangeCode))
                 return $"قبلاً معامله باز روی {symbol} داری.";
 
-            OpenTrade(chatId, symbol, entry, sl, tp, side, lev, tradeMode);
-            return $"📝 در دفتر معاملات ثبت شد (بدون سفارش صرافی)\n{tradeMode} {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\n\nاین ثبت فقط پس از انجام دستی معامله در صرافی باید انجام شود.";
+            OpenTrade(chatId, symbol, entry, sl, tp, side, lev, tradeMode, exchangeCode);
+            return $"📝 در دفتر معاملات ثبت شد (بدون سفارش صرافی)\nصرافی: {exchangeCode}\n{tradeMode} {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\n\nاین ثبت فقط برای پایش/ثبت دستی است؛ هیچ سفارشی ارسال نشده است.";
         }
 
         if (data.StartsWith("skip_", StringComparison.OrdinalIgnoreCase))
@@ -1685,26 +1831,19 @@ VALUES
             return $"📝 ثبت شد (بدون سفارش صرافی): {side} {symbol}\nEntry: {entry:N4}\nSL: {sl:N4}\nTP: {tp:N4}\nLeverage: {lev}x";
         }
 
-        if (parts[0] == "sold" && parts.Length >= 2)
+        if (parts[0] == "sold" && parts.Length >= 2 && int.TryParse(parts[1], out var closedTradeId))
         {
-            string symbol = parts[1];
-            var trades = GetOpenTrades(chatId).Where(t => t.Symbol == symbol).ToList();
-            if (trades.Count == 0)
-                return $"معامله بازی برای {symbol} نیست.";
-
-            var ticker = await GetNobitexLastPriceAsync(symbol);
-            decimal exitPrice = ticker ?? trades[0].EntryPrice;
-
-            foreach (var t in trades)
-                CloseTrade(t.Id, exitPrice, "ManualClose");
-
-            var t0 = trades[0];
-            decimal pnl = t0.Side == "SHORT"
-                ? (t0.EntryPrice - exitPrice) / t0.EntryPrice * 100
-                : (exitPrice - t0.EntryPrice) / t0.EntryPrice * 100;
-
-            return $"✅ بسته شد: {t0.Side} {symbol}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%\n" +
-                   $"(اگر پوزیشن روی نوبیتکس باز است از صرافی هم ببند)";
+            var trade = GetOpenTrades(chatId).FirstOrDefault(t => t.Id == closedTradeId);
+            if (trade is null) return "پوزیشن باز متعلق به شما پیدا نشد یا قبلاً بسته شده است.";
+            var ticker = await GetMarketLastPriceAsync(trade.ExchangeCode, trade.Symbol);
+            if (ticker is null || ticker <= 0)
+                return $"قیمت {trade.Symbol} از {trade.ExchangeCode} دریافت نشد؛ پوزیشن در دفتر باز باقی ماند.";
+            decimal exitPrice = ticker.Value;
+            CloseTrade(trade.Id, exitPrice, "ManualClose");
+            decimal pnl = trade.Side == "SHORT"
+                ? (trade.EntryPrice - exitPrice) / trade.EntryPrice * 100
+                : (exitPrice - trade.EntryPrice) / trade.EntryPrice * 100;
+            return $"✅ خروج ثبت شد: {trade.Side} {trade.Symbol}\nExchange: {trade.ExchangeCode}\nExit: {exitPrice:N4}\nPnL: {pnl:N2}%\nثبت خروج در دفتر انجام شد؛ ارسال سفارش خودکار انجام نشده است.";
         }
 
         if (parts[0] == "skip")
@@ -1716,6 +1855,12 @@ VALUES
     static async Task<string> HandleUserCommand(long chatId, string text, BinanceRestClient client)
     {
         text = text.Trim();
+
+        string normalizedCommand = text.TrimStart('/').Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            .FirstOrDefault()?.ToLowerInvariant() ?? "";
+        if (!TradingFeaturesEnabled && normalizedCommand is
+            "buy" or "sell" or "bought" or "sold" or "long" or "short" or "order" or "neworder" or "preview")
+            return "قابلیت خرید، فروش و ثبت سفارش فعلاً غیرفعال است؛ فقط تحلیل و مشاهده سیگنال‌ها در دسترس است.";
 
         // اگر فقط عدد فرستاده (مبلغ تومان) — اینجا پردازش نکن
         // باید در ListenTelegramCommands با PendingOrders هندل شود
@@ -1849,27 +1994,49 @@ VALUES
     // ==================== تحلیل ====================
 
     static async Task<List<(string Text, InlineKeyboardMarkup? Keyboard)>?> AnalyzeSymbol(
-    BinanceRestClient client, string symbol)
+    BinanceRestClient client, string symbol, string exchangeCode = "NOBITEX")
     {
         try
         {
-            var data15m = await GetNobitexQuotesAsync(symbol, "15", 100);
+            bool isBinance = exchangeCode.Equals(SignalSourcePreference.Binance, StringComparison.OrdinalIgnoreCase);
+            var data15m = isBinance
+                ? await BinancePublicMarket.GetKlinesAsync(symbol, "15m", 100)
+                : await GetNobitexQuotesAsync(symbol, "15", 100);
             await Task.Delay(200);
-            var data1h = await GetNobitexQuotesAsync(symbol, "60", 100);
+            var data1h = isBinance
+                ? await BinancePublicMarket.GetKlinesAsync(symbol, "1h", 100)
+                : await GetNobitexQuotesAsync(symbol, "60", 100);
             await Task.Delay(200);
 
             if (data15m == null || data1h == null || data15m.Count < 50 || data1h.Count < 50)
+            {
+                Console.WriteLine($"SKIP {exchangeCode}/{symbol}: insufficient candles (15m={data15m?.Count ?? 0}, 1h={data1h?.Count ?? 0}, minimum=50).");
                 return null;
+            }
 
-            decimal? live = await GetNobitexLastPriceAsync(symbol);
+            decimal? live = isBinance
+                ? await BinancePublicMarket.GetLastPriceAsync(symbol)
+                : await GetNobitexLastPriceAsync(symbol);
             decimal price = live ?? data15m.Last().Close;
-            if (price <= 0) return null;
+            if (price <= 0)
+            {
+                Console.WriteLine($"SKIP {exchangeCode}/{symbol}: invalid live/fallback price.");
+                return null;
+            }
 
-            if (IsStablePair(symbol, price)) return null;
+            if (IsStablePair(symbol, price))
+            {
+                Console.WriteLine($"SKIP {exchangeCode}/{symbol}: stable pair.");
+                return null;
+            }
 
             var a15 = AnalyzeTimeframe(data15m);
             var a1h = AnalyzeTimeframe(data1h);
-            if (!a15.IsValid || !a1h.IsValid) return null;
+            if (!a15.IsValid || !a1h.IsValid)
+            {
+                Console.WriteLine($"SKIP {exchangeCode}/{symbol}: indicators invalid (15m={a15.IsValid}, 1h={a1h.IsValid}).");
+                return null;
+            }
             var (support, resistance) = FindSupportResistance(data1h);
 
             var sma50 = data1h.GetSma(50).Last().Sma;
@@ -1891,7 +2058,10 @@ VALUES
             if (nearResistance) sellScore += 2;
             // سرعت: AI فقط نزدیک سیگنال
             if (buyScore < 4 && sellScore < 4)
+            {
+                Console.WriteLine($"FILTER {exchangeCode}/{symbol}: weak scores B/S={buyScore}/{sellScore}.");
                 return null;
+            }
 
             var (aiScore, aiReason, _) = await GetNewsAiScoreAsync(symbol, buyScore, sellScore);
             if (aiScore > 0) buyScore += aiScore;
@@ -1903,8 +2073,7 @@ VALUES
             if (aiScore >= 0 &&
                 buyScore >= 6 && buyScore >= sellScore + 2 &&
                 a15.Rsi < 65 && a1h.Rsi < 70 &&
-                (nearSupport || aboveSma50) &&
-                (bothBullish || nearSupport))
+                StrategyRules.IsConfirmedLong(bothBullish, nearSupport, aboveSma50))
             {
                 side = "LONG";
             }
@@ -1912,8 +2081,7 @@ VALUES
             else if (aiScore <= 0 &&
                      sellScore >= 6 && sellScore >= buyScore + 2 &&
                      a15.Rsi > 35 && a1h.Rsi > 30 &&
-                     (nearResistance || belowSma50) &&
-                     (bothBearish || nearResistance))
+                     StrategyRules.IsConfirmedShort(bothBearish, nearResistance, belowSma50))
             {
                 side = "SHORT";
             }
@@ -1924,7 +2092,9 @@ VALUES
             // SELL recommendations are generated per user's existing Spot holding.
             bool spotBuy = aiScore >= 0 && buyScore >= 5 && buyScore >= sellScore + 1 &&
                            a15.Rsi < 70 && a1h.Rsi < 75 &&
-                           (bothBullish || nearSupport || aboveSma50);
+                           StrategyRules.IsConfirmedLong(bothBullish, nearSupport, aboveSma50);
+            if (!spotBuy && side is null)
+                Console.WriteLine($"FILTER {exchangeCode}/{symbol}: no confirmed setup (B/S={buyScore}/{sellScore}, RSI={a15.Rsi:N1}/{a1h.Rsi:N1}, bullish={bothBullish}, bearish={bothBearish}, support={nearSupport}, resistance={nearResistance}, aboveSMA50={aboveSma50}, belowSMA50={belowSma50}, AI={aiScore}).");
             if (spotBuy)
                 AddSignal("SPOT", "BUY", TradeSide.Buy, 1);
 
@@ -1935,48 +2105,46 @@ VALUES
 
             void AddSignal(string mode, string signalSide, TradeSide tradeSide, int leverage)
             {
-                if (HasPendingSignal(symbol, mode)) return;
-                if (!StrategyRules.TryCreatePlan(tradeSide, price, support, resistance, out var plan)) return;
+                if (HasRecentSignal(symbol, mode, exchangeCode))
+                {
+                    Console.WriteLine($"SKIP {exchangeCode}/{symbol} {mode}: duplicate signal inside 4-hour cooldown.");
+                    return;
+                }
+                if (!StrategyRules.TryCreatePlan(tradeSide, price, support, resistance, out var plan))
+                {
+                    Console.WriteLine($"SKIP {exchangeCode}/{symbol} {mode}: risk/reward plan rejected (support={support:N4}, resistance={resistance:N4}).");
+                    return;
+                }
                 if (mode == "MARGIN") leverage = SuggestLeverage(plan.RiskPercent);
 
                 decimal rewardPercent = plan.RewardRiskRatio * plan.RiskPercent;
                 Console.WriteLine($"{symbol,-12} | {price,12:N4} | {mode} {signalSide} | B:{buyScore} S:{sellScore}");
-                SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, $"{mode}_{signalSide}");
-                TrackSignal(symbol, price, plan.StopLoss, plan.TakeProfit, signalSide, mode);
+                SaveAnalysis(symbol, price, a15.Rsi, buyScore, sellScore, $"{mode}_{signalSide}", exchangeCode);
+                long? signalId = TrackSignal(symbol, price, plan.StopLoss, plan.TakeProfit, signalSide, mode, exchangeCode);
+                if (signalId is null)
+                {
+                    Console.WriteLine($"SKIP DELIVERY {exchangeCode}/{symbol}: signal could not be persisted.");
+                    return;
+                }
 
                 string emoji = signalSide is "LONG" or "BUY" ? "🟢" : "🔴";
                 string text =
-                    $"{emoji} {mode} {signalSide} {symbol}\n" +
-                    $"Entry: {price:N4} (Nobitex)\n" +
+                    $"{emoji} {mode} {signalSide} {symbol} | Signal #{signalId}\n" +
+                    $"Entry: {price:N4} ({(isBinance ? "Binance Spot" : "Nobitex")})\n" +
                     $"Support: {support:N4} | Resistance: {resistance:N4}\n" +
                     $"Stop Loss: {plan.StopLoss:N4} ({plan.RiskPercent:N2}%)\n" +
                     $"Take Profit: {plan.TakeProfit:N4} ({rewardPercent:N2}%)\n" +
                     $"R/R: 1:{plan.RewardRiskRatio:N2}\n" +
-                    (mode == "SPOT" ? "بازار: Spot (بدون اهرم)\n" : $"بازار: Margin | اهرم پیشنهادی: {leverage}x\n") +
+                    (mode == "SPOT" ? "استراتژی: Spot (بدون اهرم)\n" : $"استراتژی: Margin | اهرم پیشنهادی: {leverage}x\n") +
+                    $"منبع قیمت: {(isBinance ? "Binance Spot" : "Nobitex")}\n" +
                     $"Score B/S: {buyScore}/{sellScore}\n" +
                     $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n" +
                     $"AI/News: {aiScore} ({aiReason})\n\n" +
-                    "این فقط پیشنهاد تحلیلی است؛ سفارش فقط پس از تأیید دستی و اتصال حساب ارسال خواهد شد.";
+                    "این فقط پیشنهاد تحلیلی است؛ ارسال سفارش واقعی در این نسخه غیرفعال است.";
 
-                var inv = System.Globalization.CultureInfo.InvariantCulture;
-                string payload =
-                    $"{signalSide.ToLowerInvariant()}|{symbol}|{price.ToString(inv)}|" +
-                    $"{plan.StopLoss.ToString(inv)}|{plan.TakeProfit.ToString(inv)}|{leverage}|{mode}";
-                string id = StorePayload(payload);
-                var keyboard = new InlineKeyboardMarkup(new[]
-                {
-                    new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData("🟢 خرید Spot با USDT", $"ui|sigtrade|{id}|buy"),
-                        InlineKeyboardButton.WithCallbackData("🔴 فروش Spot", $"ui|sigtrade|{id}|sell")
-                    },
-                    new[]
-                    {
-                        InlineKeyboardButton.WithCallbackData("📝 ثبت در دفتر معاملات", $"note_{id}"),
-                        InlineKeyboardButton.WithCallbackData("❌ رد", $"skip_{symbol}")
-                    }
-                });
-                results.Add((text, keyboard));
+                // Signal messages stay informational; trade controls are intentionally
+                // omitted while TradingFeaturesEnabled is false.
+                results.Add((text, null));
             }
         }
         catch (Exception ex)
@@ -2153,17 +2321,23 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
 
     static async Task<string?> AnalyzeSellForOpenTrade(OpenTradeRow trade)
     {
-        if (!string.Equals(trade.ExchangeCode, "NOBITEX", StringComparison.OrdinalIgnoreCase))
-            return null; // Other adapters are introduced in the multi-exchange phase.
-
+        bool isBinance = trade.ExchangeCode.Equals(SignalSourcePreference.Binance, StringComparison.OrdinalIgnoreCase);
+        if (!isBinance && !trade.ExchangeCode.Equals(SignalSourcePreference.Nobitex, StringComparison.OrdinalIgnoreCase))
+            return null;
         string symbol = trade.Symbol;
-        var data15m = await GetNobitexQuotesAsync(symbol, "15", 100);
+        var data15m = isBinance
+            ? await BinancePublicMarket.GetKlinesAsync(symbol, "15m", 100)
+            : await GetNobitexQuotesAsync(symbol, "15", 100);
         await Task.Delay(150);
-        var data1h = await GetNobitexQuotesAsync(symbol, "60", 100);
+        var data1h = isBinance
+            ? await BinancePublicMarket.GetKlinesAsync(symbol, "1h", 100)
+            : await GetNobitexQuotesAsync(symbol, "60", 100);
         if (data15m == null || data1h == null || data15m.Count < 50 || data1h.Count < 50)
             return null;
 
-        var live = await GetNobitexLastPriceAsync(symbol);
+        var live = isBinance
+            ? await BinancePublicMarket.GetLastPriceAsync(symbol)
+            : await GetNobitexLastPriceAsync(symbol);
         if (live is null || live <= 0) return null;
         decimal price = live.Value;
 
@@ -2191,7 +2365,7 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         string action = trade.TradeMode == "SPOT" ? "SELL" : trade.Side == "SHORT" ? "COVER SHORT" : "CLOSE LONG";
         return $"🔴 {action} (معامله باز شما)\n" +
                $"{symbol}\n" +
-               $"Price: {price:N4}\n" +
+               $"Price: {price:N4} ({trade.ExchangeCode})\n" +
                $"Score B/S: {buyScore}/{sellScore}\n" +
                $"RSI 15m/1h: {a15.Rsi:N1}/{a1h.Rsi:N1}\n\n" +
                $"پس از انجام دستی معامله در صرافی، دکمه ثبت خروج را بزن.";
@@ -2418,15 +2592,17 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         return list;
     }
 
-    static void SaveAnalysis(string symbol, decimal price, double rsi, int buy, int sell, string decision)
+    static void SaveAnalysis(string symbol, decimal price, double rsi, int buy, int sell, string decision,
+        string exchangeCode = "NOBITEX")
     {
         using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
         cmd.CommandText = @"
-            INSERT INTO AnalysisResults (Symbol, Timeframe, Price, RSI, BuyScore, SellScore, Decision)
-            VALUES ($s, '15m+1h', $p, $r, $b, $sell, $d)";
+            INSERT INTO AnalysisResults (Symbol, ExchangeCode, Timeframe, Price, RSI, BuyScore, SellScore, Decision)
+            VALUES ($s, $exchange, '15m+1h', $p, $r, $b, $sell, $d)";
         cmd.Parameters.AddWithValue("$s", symbol);
+        cmd.Parameters.AddWithValue("$exchange", exchangeCode);
         cmd.Parameters.AddWithValue("$p", price);
         cmd.Parameters.AddWithValue("$r", rsi);
         cmd.Parameters.AddWithValue("$b", buy);
@@ -2435,17 +2611,18 @@ Reply ONLY valid JSON: {{""score"": 1, ""reason"": ""short reason""}}";
         cmd.ExecuteNonQuery();
     }
 
-    static bool HasOpenTrade(long chatId, string symbol, string? tradeMode = null)
+    static bool HasOpenTrade(long chatId, string symbol, string? tradeMode = null, string? exchangeCode = null)
     {
         using var conn = new SqliteConnection(DatabaseConnectionString);
         conn.Open();
         var cmd = conn.CreateCommand();
-        cmd.CommandText = tradeMode is null
-            ? "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND Status='Open'"
-            : "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND TradeMode=$m AND Status='Open'";
+        cmd.CommandText = "SELECT COUNT(1) FROM OpenTrades WHERE ChatId=$c AND Symbol=$s AND Status='Open'" +
+            (tradeMode is null ? "" : " AND TradeMode=$m") +
+            (exchangeCode is null ? "" : " AND ExchangeCode=$exchange");
         cmd.Parameters.AddWithValue("$c", chatId);
         cmd.Parameters.AddWithValue("$s", symbol);
         if (tradeMode is not null) cmd.Parameters.AddWithValue("$m", tradeMode);
+        if (exchangeCode is not null) cmd.Parameters.AddWithValue("$exchange", exchangeCode);
         return Convert.ToInt32(cmd.ExecuteScalar()) > 0;
     }
 
@@ -2561,11 +2738,7 @@ WHERE Id=$id AND Status='Open' AND (ExitReason IS NULL OR ExitReason NOT LIKE 'E
         {
             try
             {
-                if (!string.Equals(t.ExchangeCode, "NOBITEX", StringComparison.OrdinalIgnoreCase))
-                    continue; // Never price a non-Nobitex position with Nobitex quotes.
-
-                // قیمت از نوبیتکس (هم‌خوان با ورود)
-                decimal? live = await GetNobitexLastPriceAsync(t.Symbol);
+                decimal? live = await GetMarketLastPriceAsync(t.ExchangeCode, t.Symbol);
                 await Task.Delay(150);
 
                 if (live is null || live <= 0)
@@ -2614,7 +2787,7 @@ WHERE Id=$id AND Status='Open' AND (ExitReason IS NULL OR ExitReason NOT LIKE 'E
                         $"Entry: {t.EntryPrice:N4}\nNow: {price:N4}\n" +
                         $"PnL: {pnlPercent:N2}%\n\n" +
                         "پوزیشن هنوز در دفتر باز است. ابتدا در صرافی به‌صورت دستی خارج شو؛ سپس ثبت خروج را بزن.",
-                        replyMarkup: keyboard);
+                        replyMarkup: MainReplyKeyboard());
                     continue;
                 }
                 else
@@ -2645,7 +2818,7 @@ WHERE Id=$id AND Status='Open' AND (ExitReason IS NULL OR ExitReason NOT LIKE 'E
                             $"Now: {price:N4}\n" +
                             $"PnL: {pnlPercent:N2}%\n" +
                             $"SL: {t.StopLoss:N4} | TP: {t.TakeProfit:N4}",
-                            replyMarkup: keyboard);
+                            replyMarkup: MainReplyKeyboard());
                     }
                 }
             }
@@ -2766,6 +2939,13 @@ WHERE Id=$id AND Status='Open' AND (ExitReason IS NULL OR ExitReason NOT LIKE 'E
         }
         return null;
     }
+
+    static Task<decimal?> GetMarketLastPriceAsync(string exchangeCode, string symbol) =>
+        exchangeCode.Equals(SignalSourcePreference.Binance, StringComparison.OrdinalIgnoreCase)
+            ? BinancePublicMarket.GetLastPriceAsync(symbol)
+            : exchangeCode.Equals(SignalSourcePreference.Nobitex, StringComparison.OrdinalIgnoreCase)
+                ? GetNobitexLastPriceAsync(symbol)
+                : Task.FromResult<decimal?>(null);
 
     static async Task<List<Quote>?> GetQuotes(BinanceRestClient client, string symbol, KlineInterval interval, int limit)
     {
@@ -2941,7 +3121,8 @@ SELECT Id,
        TakeProfit,
        Status,
        SignalAt,
-       ResolvePrice
+       ResolvePrice,
+       IFNULL(ExchangeCode, 'NOBITEX')
 FROM SignalTracks
 WHERE Status = 'Pending';";
             using var r = cmd.ExecuteReader();
@@ -2959,7 +3140,8 @@ WHERE Status = 'Pending';";
                     Status = r.GetString(7),
                     SignalAt = DateTime.Parse(r.GetString(8), null,
                         System.Globalization.DateTimeStyles.RoundtripKind),
-                    ExitPrice = r.IsDBNull(9) ? null : r.GetDecimal(9)
+                    ExitPrice = r.IsDBNull(9) ? null : r.GetDecimal(9),
+                    ExchangeCode = r.GetString(10)
                 });
             }
         }
@@ -2971,7 +3153,7 @@ WHERE Status = 'Pending';";
     }
 
     // ==================== UpdateSignal ====================
-    static void UpdateSignal(long id, string status, decimal exitPrice)
+    static void UpdateSignal(long id, string status, decimal? exitPrice)
     {
         try
         {
@@ -2985,7 +3167,7 @@ SET Status = $st,
     ResolvedAt = $rt
 WHERE Id = $id;";
             cmd.Parameters.AddWithValue("$st", status);
-            cmd.Parameters.AddWithValue("$ex", exitPrice);
+            cmd.Parameters.AddWithValue("$ex", exitPrice is null ? DBNull.Value : exitPrice.Value);
             cmd.Parameters.AddWithValue("$rt", DateTime.UtcNow.ToString("o"));
             cmd.Parameters.AddWithValue("$id", id);
             cmd.ExecuteNonQuery();
@@ -3005,35 +3187,54 @@ WHERE Id = $id;";
         {
             try
             {
-                var live = await GetNobitexLastPriceAsync(s.Symbol);
-                if (live is null || live <= 0) continue;
+                var live = await GetMarketLastPriceAsync(s.ExchangeCode, s.Symbol);
+                if (live is null || live <= 0)
+                {
+                    var unavailableOutcome = StrategyRules.EvaluateSignal(
+                        s.Side, 0m, s.StopLoss, s.TakeProfit, s.SignalAt,
+                        DateTime.UtcNow, TimeSpan.FromHours(24));
+                    if (unavailableOutcome == SignalOutcome.Expired)
+                    {
+                        UpdateSignal(s.Id, "Expired", null);
+                        LogSignalEvaluation(s.Id, null, "RESOLVED_EXPIRED",
+                            "Signal lifetime exceeded 24 hours; no reliable market price was available at expiry.");
+                        Console.WriteLine($"Signal Expired without exit price: {s.Side} {s.Symbol}");
+                        continue;
+                    }
+                    LogSignalEvaluation(s.Id, null, "PRICE_UNAVAILABLE",
+                        $"Could not retrieve ticker from {s.ExchangeCode}; signal remains pending.");
+                    Console.WriteLine($"Signal #{s.Id} check unavailable: {s.ExchangeCode}/{s.Symbol}");
+                    continue;
+                }
                 decimal price = live.Value;
                 string side = string.IsNullOrWhiteSpace(s.Side) ? "LONG" : s.Side.ToUpperInvariant();
 
-                bool isShort = side == "SHORT";
-                bool hitSl = isShort
-                    ? StrategyRules.IsShortStopLossHit(price, s.StopLoss)
-                    : StrategyRules.IsLongStopLossHit(price, s.StopLoss);
-                bool hitTp = isShort
-                    ? StrategyRules.IsShortTakeProfitHit(price, s.TakeProfit)
-                    : StrategyRules.IsLongTakeProfitHit(price, s.TakeProfit);
+                var outcome = StrategyRules.EvaluateSignal(
+                    side, price, s.StopLoss, s.TakeProfit, s.SignalAt,
+                    DateTime.UtcNow, TimeSpan.FromHours(24));
+
+                LogSignalEvaluation(s.Id, price, outcome.ToString(),
+                    $"Side={side}; Entry={s.Entry:N8}; SL={s.StopLoss:N8}; TP={s.TakeProfit:N8}; Exchange={s.ExchangeCode}");
 
                 // If both thresholds were crossed between polls, intrabar order is
                 // unknowable from a ticker snapshot; classify conservatively as SL.
-                if (hitSl)
-                {
-                    UpdateSignal(s.Id, "HitSL", price);
-                    Console.WriteLine($"Signal HitSL: {side} {s.Symbol} @ {price:N4}");
-                }
-                else if (hitTp)
-                {
-                    UpdateSignal(s.Id, "HitTP", price);
-                    Console.WriteLine($"Signal HitTP: {side} {s.Symbol} @ {price:N4}");
-                }
-                else if (DateTime.UtcNow - s.SignalAt.ToUniversalTime() > TimeSpan.FromHours(24))
+                if (outcome == SignalOutcome.Expired)
                 {
                     UpdateSignal(s.Id, "Expired", price);
+                    LogSignalEvaluation(s.Id, price, "RESOLVED_EXPIRED", "Signal lifetime exceeded 24 hours.");
                     Console.WriteLine($"Signal Expired: {side} {s.Symbol} @ {price:N4}");
+                }
+                else if (outcome == SignalOutcome.HitStopLoss)
+                {
+                    UpdateSignal(s.Id, "HitSL", price);
+                    LogSignalEvaluation(s.Id, price, "RESOLVED_HIT_SL", "Stop-loss threshold reached.");
+                    Console.WriteLine($"Signal HitSL: {side} {s.Symbol} @ {price:N4}");
+                }
+                else if (outcome == SignalOutcome.HitTakeProfit)
+                {
+                    UpdateSignal(s.Id, "HitTP", price);
+                    LogSignalEvaluation(s.Id, price, "RESOLVED_HIT_TP", "Take-profit threshold reached.");
+                    Console.WriteLine($"Signal HitTP: {side} {s.Symbol} @ {price:N4}");
                 }
             }
             catch (Exception ex)
@@ -3057,8 +3258,10 @@ WHERE Id = $id;";
 
             var cmd = conn.CreateCommand();
             cmd.CommandText = @"
-SELECT Id, Symbol, IFNULL(Side,'LONG'), EntryPrice, StopLoss, TakeProfit,
-       Status, SignalAt, ResolvePrice
+SELECT Id, Symbol, IFNULL(Side,'LONG'), IFNULL(ExchangeCode,'NOBITEX'), EntryPrice, StopLoss, TakeProfit,
+       Status, SignalAt, ResolvePrice,
+       (SELECT COUNT(1) FROM SignalEvaluationLogs e WHERE e.SignalTrackId=SignalTracks.Id) AS Checks,
+       (SELECT MAX(CheckedAt) FROM SignalEvaluationLogs e WHERE e.SignalTrackId=SignalTracks.Id) AS LastCheckedAt
 FROM SignalTracks
 ORDER BY Id DESC
 LIMIT 200;";
@@ -3070,12 +3273,15 @@ LIMIT 200;";
                     total++;
                     string symbol = r.GetString(1);
                     string side = r.IsDBNull(2) ? "LONG" : r.GetString(2);
-                    decimal entry = r.GetDecimal(3);
-                    decimal sl = r.GetDecimal(4);
-                    decimal tp = r.GetDecimal(5);
-                    string status = r.GetString(6);
-                    string at = r.GetString(7);
-                    decimal? exit = r.IsDBNull(8) ? null : r.GetDecimal(8);
+                    string exchangeCode = r.GetString(3);
+                    decimal entry = r.GetDecimal(4);
+                    decimal sl = r.GetDecimal(5);
+                    decimal tp = r.GetDecimal(6);
+                    string status = r.GetString(7);
+                    string at = r.GetString(8);
+                    decimal? exit = r.IsDBNull(9) ? null : r.GetDecimal(9);
+                    long checks = r.IsDBNull(10) ? 0 : r.GetInt64(10);
+                    string lastChecked = r.IsDBNull(11) ? "not checked" : r.GetString(11);
 
                     switch (status)
                     {
@@ -3091,7 +3297,7 @@ LIMIT 200;";
                     if (lines.Count < 15)
                     {
                         lines.Add(
-                            $"{symbol} | {side} | E:{entry:N4} | TP:{tp:N4} | SL:{sl:N4} | {status} | {at}");
+                            $"{exchangeCode} | {symbol} | {side} | E:{entry:N4} | TP:{tp:N4} | SL:{sl:N4} | {status} | checks:{checks} | last:{lastChecked}");
                     }
                 }
             }
@@ -3207,6 +3413,7 @@ LIMIT 50;";
         public string Status { get; set; } = "Pending";
         public DateTime SignalAt { get; set; }
         public decimal? ExitPrice { get; set; }
+        public string ExchangeCode { get; set; } = "NOBITEX";
     }
 
     class NobitexOrderResult
